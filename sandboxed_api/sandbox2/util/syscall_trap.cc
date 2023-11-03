@@ -30,8 +30,9 @@ namespace {
 #if defined(SAPI_X86_64)
 constexpr int kRegResult = REG_RAX;
 constexpr int kRegSyscall = REG_RAX;
-constexpr std::array kRegArgs = {REG_RDI, REG_RSI, REG_RDX,
-                                 REG_R10, REG_R8,  REG_R9};
+// ANDROID: On musl these are distinct enum types. Coerce to int.
+constexpr std::array<int, 6> kRegArgs = {REG_RDI, REG_RSI, REG_RDX,
+                                         REG_R10, REG_R8,  REG_R9};
 #elif defined(SAPI_PPC64_LE)
 constexpr int kRegResult = 3;
 constexpr int kRegSyscall = 0;
