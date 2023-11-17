@@ -16,9 +16,7 @@
 // Usage is only approved for sandboxing host-side Cuttlefish tools to run them
 // in Google's internal production environment.
 package {
-    default_visibility: [
-        "//device/google/cuttlefish:__subpackages__",
-    ]
+    default_visibility: [":__subpackages__"]
 }
 
 cc_defaults {
@@ -36,6 +34,7 @@ cc_library {
         "sandboxed_api/sandbox2/logserver.proto",
         "sandboxed_api/sandbox2/mount_tree.proto",
         "sandboxed_api/sandbox2/violation.proto",
+        "sandboxed_api/sandbox2/unwind/unwind.proto",
         "sandboxed_api/util/status.proto",
     ],
     proto: {
@@ -46,22 +45,66 @@ cc_library {
     defaults: ["sandboxed_api_defaults"],
 }
 
+cc_defaults {
+    name: "sandboxed_api_cc_defaults",
+    static_libs: [
+        "libabsl_host",
+        "libcap",
+        "libprotobuf-cpp-full",
+        "sandboxed_api_proto",
+    ],
+    arch: {
+        x86: {
+            enabled: false,
+        },
+    },
+    target: {
+        linux_glibc: {
+            cflags: [
+                "-include android/sandboxed_api_glibc_compat.h",
+            ],
+            include_dirs: [
+                "bionic/libc/kernel/android/uapi",
+                "bionic/libc/kernel/uapi",
+            ],
+        },
+        linux_musl: {
+            cflags: [
+                "-include android/sandboxed_api_musl_compat.h",
+            ],
+        },
+    },
+    cflags: [
+        "-Wno-unused-parameter",
+        "-fbracket-depth=768", // for syscall_defs.cc
+    ],
+    defaults: ["sandboxed_api_defaults"],
+}
+
+
 cc_library {
-    name: "sandboxed_api",
+    name: "sandboxed_api_shared_with_forkserver",
     srcs: [
+        "android/unwind.cc",
         "sandboxed_api/config.cc",
         "sandboxed_api/sandbox2/bpfdisassembler.cc",
         "sandboxed_api/sandbox2/buffer.cc",
+        "sandboxed_api/sandbox2/client.cc",
         "sandboxed_api/sandbox2/comms.cc",
+        "sandboxed_api/sandbox2/forkserver.cc",
         "sandboxed_api/sandbox2/ipc.cc",
         "sandboxed_api/sandbox2/logserver.cc",
         "sandboxed_api/sandbox2/logsink.cc",
         "sandboxed_api/sandbox2/mounts.cc",
         "sandboxed_api/sandbox2/namespace.cc",
+        "sandboxed_api/sandbox2/network_proxy/client.cc",
         "sandboxed_api/sandbox2/regs.cc",
         "sandboxed_api/sandbox2/result.cc",
+        "sandboxed_api/sandbox2/sanitizer.cc",
         "sandboxed_api/sandbox2/syscall.cc",
         "sandboxed_api/sandbox2/syscall_defs.cc",
+        "sandboxed_api/sandbox2/unwind/ptrace_hook.cc",
+        "sandboxed_api/sandbox2/unwind/unwind.cc",
         "sandboxed_api/sandbox2/util.cc",
         "sandboxed_api/sandbox2/util/bpf_helper.c",
         "sandboxed_api/sandbox2/util/maps_parser.cc",
@@ -75,32 +118,17 @@ cc_library {
         "sandboxed_api/util/strerror.cc",
         "sandboxed_api/util/temp_file.cc",
     ],
+    defaults: ["sandboxed_api_cc_defaults"],
+}
+
+cc_binary {
+    name: "sandboxed_api_forkserver",
+    srcs: [
+        "sandboxed_api/sandbox2/forkserver_bin.cc",
+    ],
     static_libs: [
-        "libabsl_host",
-        "sandboxed_api_proto",
-        "libprotobuf-cpp-full",
+        "sandboxed_api_shared_with_forkserver",
     ],
-    arch: {
-        x86: {
-            enabled: false,
-        },
-    },
-    target: {
-        linux_glibc: {
-            enabled: false,
-            cflags: [
-                // Typo in old glibc
-                "-DPTRACE_EVENT_SECCOMP=PTRAVE_EVENT_SECCOMP",
-            ],
-        },
-        linux_musl: {
-            enabled: true,
-        },
-    },
-    cflags: [
-        "-Wno-unused-parameter",
-        "-fbracket-depth=768", // for syscall_defs.cc
-    ],
-    defaults: ["sandboxed_api_defaults"],
+    defaults: ["sandboxed_api_cc_defaults"],
 }
 
