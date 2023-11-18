@@ -33,7 +33,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "libunwind-ptrace.h"
+//#include "libunwind-ptrace.h" Android: libunwind was removed in aosp/1670175
 #include "sandboxed_api/config.h"
 #include "sandboxed_api/sandbox2/comms.h"
 #include "sandboxed_api/sandbox2/unwind/ptrace_hook.h"
@@ -87,6 +87,7 @@ absl::StatusOr<std::vector<uintptr_t>> UnwindUsingFramePointer(pid_t pid,
   return ips;
 }
 
+#if 0 // Android: libunwind is not available
 absl::StatusOr<std::vector<uintptr_t>> RunLibUnwind(pid_t pid, int max_frames) {
   static unw_addr_space_t as =
       unw_create_addr_space(&_UPT_accessors, 0 /* byte order */);
@@ -152,6 +153,7 @@ absl::StatusOr<std::vector<uintptr_t>> RunLibUnwind(pid_t pid, int max_frames) {
   }
   return ips;
 }
+#endif
 
 absl::StatusOr<std::vector<std::string>> SymbolizeStacktrace(
     pid_t pid, const std::vector<uintptr_t>& ips) {
@@ -288,11 +290,13 @@ bool RunLibUnwindAndSymbolizer(Comms* comms) {
   return comms->SendProtoBuf(msg);
 }
 
+#if 0
 absl::StatusOr<std::vector<std::string>> RunLibUnwindAndSymbolizer(
     pid_t pid, int max_frames) {
   SAPI_ASSIGN_OR_RETURN(std::vector<uintptr_t> ips,
                         RunLibUnwind(pid, max_frames));
   return SymbolizeStacktrace(pid, ips);
 }
+#endif
 
 }  // namespace sandbox2
