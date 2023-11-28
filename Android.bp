@@ -1,0 +1,106 @@
+//
+// Copyright (C) 2023 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Usage is only approved for sandboxing host-side Cuttlefish tools to run them
+// in Google's internal production environment.
+package {
+    default_visibility: [
+        "//device/google/cuttlefish:__subpackages__",
+    ]
+}
+
+cc_defaults {
+    name: "sandboxed_api_defaults",
+    device_supported: false,
+    host_supported: true,
+}
+
+cc_library {
+    name: "sandboxed_api_proto",
+    srcs: [
+        "sandboxed_api/proto_arg.proto",
+        "sandboxed_api/sandbox2/comms_test.proto",
+        "sandboxed_api/sandbox2/forkserver.proto",
+        "sandboxed_api/sandbox2/logserver.proto",
+        "sandboxed_api/sandbox2/mount_tree.proto",
+        "sandboxed_api/sandbox2/violation.proto",
+        "sandboxed_api/util/status.proto",
+    ],
+    proto: {
+        canonical_path_from_root: false,
+        export_proto_headers: true,
+        type: "full",
+    },
+    defaults: ["sandboxed_api_defaults"],
+}
+
+cc_library {
+    name: "sandboxed_api",
+    srcs: [
+        "sandboxed_api/config.cc",
+        "sandboxed_api/sandbox2/bpfdisassembler.cc",
+        "sandboxed_api/sandbox2/buffer.cc",
+        "sandboxed_api/sandbox2/comms.cc",
+        "sandboxed_api/sandbox2/ipc.cc",
+        "sandboxed_api/sandbox2/logserver.cc",
+        "sandboxed_api/sandbox2/logsink.cc",
+        "sandboxed_api/sandbox2/mounts.cc",
+        "sandboxed_api/sandbox2/namespace.cc",
+        "sandboxed_api/sandbox2/regs.cc",
+        "sandboxed_api/sandbox2/result.cc",
+        "sandboxed_api/sandbox2/syscall.cc",
+        "sandboxed_api/sandbox2/syscall_defs.cc",
+        "sandboxed_api/sandbox2/util.cc",
+        "sandboxed_api/sandbox2/util/bpf_helper.c",
+        "sandboxed_api/sandbox2/util/maps_parser.cc",
+        "sandboxed_api/sandbox2/util/minielf.cc",
+        "sandboxed_api/sandbox2/util/syscall_trap.cc",
+        "sandboxed_api/util/file_helpers.cc",
+        "sandboxed_api/util/fileops.cc",
+        "sandboxed_api/util/path.cc",
+        "sandboxed_api/util/raw_logging.cc",
+        "sandboxed_api/util/status.cc",
+        "sandboxed_api/util/strerror.cc",
+        "sandboxed_api/util/temp_file.cc",
+    ],
+    static_libs: [
+        "libabsl_host",
+        "sandboxed_api_proto",
+        "libprotobuf-cpp-full",
+    ],
+    arch: {
+        x86: {
+            enabled: false,
+        },
+    },
+    target: {
+        linux_glibc: {
+            enabled: false,
+            cflags: [
+                // Typo in old glibc
+                "-DPTRACE_EVENT_SECCOMP=PTRAVE_EVENT_SECCOMP",
+            ],
+        },
+        linux_musl: {
+            enabled: true,
+        },
+    },
+    cflags: [
+        "-Wno-unused-parameter",
+        "-fbracket-depth=768", // for syscall_defs.cc
+    ],
+    defaults: ["sandboxed_api_defaults"],
+}
+
