@@ -76,6 +76,7 @@ cc_defaults {
     },
     cflags: [
         "-Wno-unused-parameter",
+        "-Wno-missing-field-initializers", // for sandboxed_api/sandbox2/policy.cc
         "-fbracket-depth=768", // for syscall_defs.cc
     ],
     defaults: ["sandboxed_api_defaults"],
@@ -235,10 +236,21 @@ cc_library {
     srcs: [
         "sandboxed_api/embed_file.cc",
         "sandboxed_api/sandbox2/executor.cc",
+        "sandboxed_api/sandbox2/forkingclient.cc",
         "sandboxed_api/sandbox2/global_forkclient.cc",
+        "sandboxed_api/sandbox2/monitor_base.cc",
+        "sandboxed_api/sandbox2/monitor_ptrace.cc",
+        "sandboxed_api/sandbox2/monitor_unotify.cc",
+        "sandboxed_api/sandbox2/policy.cc",
+        "sandboxed_api/sandbox2/policybuilder.cc",
+        "sandboxed_api/sandbox2/sandbox2.cc",
+        "sandboxed_api/sandbox2/stack_trace.cc",
+        "sandboxed_api/sandbox2/network_proxy/filtering.cc",
+        "sandboxed_api/sandbox2/network_proxy/server.cc",
     ],
     visibility: ["//device/google/cuttlefish:__subpackages__"],
     whole_static_libs: [
+        "sandboxed_api_proto",
         "sandboxed_api_shared_with_filewrapper",
         "sandboxed_api_shared_with_forkserver",
     ],
