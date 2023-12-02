@@ -17,3 +17,26 @@
 // Typo in old glibc
 #define PTRACE_EVENT_SECCOMP PTRAVE_EVENT_SECCOMP
 
+// From aosp/599933
+/*
+ * Older glibc builds predate seccomp inclusion.  These arches are the ones
+ * AOSP needs and doesn't provide anything newer.  All other targets can upgrade
+ * their kernel headers.
+ */
+#ifndef SYS_seccomp
+# if defined(__x86_64__)
+#  define SYS_seccomp 317
+# elif defined(__i386__)
+#  define SYS_seccomp 354
+# elif defined(__aarch64__)
+#  define SYS_seccomp 277
+# elif defined(__arm__)
+#  define SYS_seccomp 383
+# else
+#  error "Update your kernel headers"
+# endif
+#endif
+
+#ifndef PTRACE_O_EXITKILL
+#define PTRACE_O_EXITKILL (1 << 20)
+#endif
