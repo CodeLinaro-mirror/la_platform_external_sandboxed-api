@@ -14,4 +14,10 @@
 // limitations under the License.
 #pragma once
 
+// From aosp/2263921
+#define __SIGRTMIN 32
+#define __SIGRTMAX 64
+
 typedef int __ptrace_request;
+
+typedef int __rlimit_resource;
