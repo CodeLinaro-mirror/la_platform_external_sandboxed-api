@@ -148,7 +148,6 @@ cc_binary {
         "sandboxed_api_shared_with_filewrapper",
         "sandboxed_api_shared_with_forkserver",
     ],
-    stl: "libc++_static",
     defaults: ["sandboxed_api_cc_defaults"],
 }
 
