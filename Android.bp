@@ -63,10 +63,6 @@ cc_defaults {
             cflags: [
                 "-include android/sandboxed_api_glibc_compat.h",
             ],
-            include_dirs: [
-                "bionic/libc/kernel/android/uapi",
-                "bionic/libc/kernel/uapi",
-            ],
         },
         linux_musl: {
             cflags: [
@@ -152,6 +148,7 @@ cc_binary {
         "sandboxed_api_shared_with_filewrapper",
         "sandboxed_api_shared_with_forkserver",
     ],
+    stl: "libc++_static",
     defaults: ["sandboxed_api_cc_defaults"],
 }
 
