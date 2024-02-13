@@ -60,6 +60,7 @@
 #include "sandboxed_api/sandbox2/namespace.h"
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/syscall.h"
+#include "sandboxed_api/sandbox2/trace_all_syscalls.h"
 #include "sandboxed_api/sandbox2/util/bpf_helper.h"
 #include "sandboxed_api/sandbox2/violation.pb.h"
 #include "sandboxed_api/util/path.h"
@@ -70,6 +71,9 @@
 #include <asm/termbits.h>  // On PPC, TCGETS macro needs termios
 #endif
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
 #endif
@@ -285,6 +289,7 @@ PolicyBuilder& PolicyBuilder::AllowTcMalloc() {
         LABEL(&labels, prot_none),
         ARG_32(3),  // flags
         JEQ32(MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, ALLOW),
+        JEQ32(MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, ALLOW),
         JEQ32(MAP_ANONYMOUS | MAP_PRIVATE, ALLOW),
 
         LABEL(&labels, mmap_end),
@@ -329,7 +334,7 @@ PolicyBuilder& PolicyBuilder::AllowLlvmSanitizers() {
   // example:
   // https://github.com/llvm/llvm-project/blob/596d534ac3524052df210be8d3c01a33b2260a42/compiler-rt/lib/asan/asan_allocator.cpp#L980
   // https://github.com/llvm/llvm-project/blob/62ec4ac90738a5f2d209ed28c822223e58aaaeb7/compiler-rt/lib/sanitizer_common/sanitizer_allocator_secondary.h#L98
-  AllowMmap();
+  AllowMmapWithoutExec();
   AllowSyscall(__NR_munmap);
   AllowSyscall(__NR_sched_yield);
 
@@ -359,7 +364,7 @@ PolicyBuilder& PolicyBuilder::AllowLlvmSanitizers() {
   OverridableBlockSyscallWithErrno(__NR_ioctl, EPERM);
   // https://github.com/llvm/llvm-project/blob/9aa39481d9eb718e872993791547053a3c1f16d5/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp#L150
   // https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/pthread_getattr_np.c;h=de7edfa0928224eb8375e2fe894d6677570fbb3b;hb=HEAD#l188
-  OverridableBlockSyscallWithErrno(__NR_sched_getaffinity, EPERM);
+  AllowSyscall(__NR_sched_getaffinity);
   // https://github.com/llvm/llvm-project/blob/02c2b472b510ff55679844c087b66e7837e13dc2/compiler-rt/lib/sanitizer_common/sanitizer_linux.cpp#L434
 #ifdef __NR_readlink
   OverridableBlockSyscallWithErrno(__NR_readlink, ENOENT);
@@ -413,6 +418,14 @@ PolicyBuilder& PolicyBuilder::AllowLimitedMadvise() {
                                               JEQ32(MADV_HUGEPAGE, ALLOW),
                                               JEQ32(MADV_NOHUGEPAGE, ALLOW),
                                           });
+}
+
+PolicyBuilder& PolicyBuilder::AllowMmapWithoutExec() {
+  return AddPolicyOnMmap({
+      ARG_32(2),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, PROT_EXEC, 1, 0),
+      ALLOW,
+  });
 }
 
 PolicyBuilder& PolicyBuilder::AllowMmap() {
@@ -760,11 +773,13 @@ PolicyBuilder& PolicyBuilder::AllowRestartableSequences(
   AllowFutexOp(FUTEX_WAKE);
   AllowRead();
   AllowOpen();
+  AllowPoll();
   AllowSyscall(__NR_close);
   AddPolicyOnSyscall(__NR_rt_sigprocmask, {
                                               ARG_32(0),
                                               JEQ32(SIG_SETMASK, ALLOW),
                                           });
+  AllowPrctlSetVma();
   if (cpu_fence_mode == kAllowSlowFences) {
     AllowSyscall(__NR_sched_getaffinity);
     AllowSyscall(__NR_sched_setaffinity);
@@ -796,6 +811,9 @@ PolicyBuilder& PolicyBuilder::AllowGetPGIDs() {
 }
 
 PolicyBuilder& PolicyBuilder::AllowGetRlimit() {
+#ifdef __NR_prlimit64
+  AddPolicyOnSyscall(__NR_prlimit64, {ARG(2), JEQ64(0, 0, ALLOW)});
+#endif
   return AllowSyscalls({
 #ifdef __NR_getrlimit
       __NR_getrlimit,
@@ -808,6 +826,9 @@ PolicyBuilder& PolicyBuilder::AllowGetRlimit() {
 
 PolicyBuilder& PolicyBuilder::AllowSetRlimit() {
   return AllowSyscalls({
+#ifdef __NR_prlimit64
+      __NR_prlimit64,
+#endif
 #ifdef __NR_setrlimit
       __NR_setrlimit,
 #endif
@@ -856,7 +877,7 @@ PolicyBuilder& PolicyBuilder::AllowLogForwarding() {
                                               ARG_32(0),
                                               JEQ32(SIG_BLOCK, ALLOW),
                                           });
-  AllowSyscall(__NR_prlimit64);
+  AllowGetRlimit();
 
   // For LOG(FATAL)
   return AddPolicyOnSyscall(__NR_kill,
@@ -990,13 +1011,13 @@ PolicyBuilder& PolicyBuilder::AllowStaticStartup() {
   OverridableBlockSyscallWithErrno(__NR_readlink, ENOENT);
 #endif
 
-#ifdef __NR_prlimit64
-  OverridableBlockSyscallWithErrno(__NR_prlimit64, EPERM);
-#endif
+  AllowGetRlimit();
   AddPolicyOnSyscall(__NR_mprotect, {
                                         ARG_32(2),
                                         JEQ32(PROT_READ, ALLOW),
                                     });
+
+  OverridableBlockSyscallWithErrno(__NR_sigaltstack, ENOSYS);
 
   return *this;
 }
@@ -1221,6 +1242,11 @@ PolicyBuilder& PolicyBuilder::DangerDefaultAllowAll() {
 
 PolicyBuilder& PolicyBuilder::DefaultAction(AllowAllSyscalls) {
   default_action_ = ALLOW;
+  return *this;
+}
+
+PolicyBuilder& PolicyBuilder::DefaultAction(TraceAllSyscalls) {
+  default_action_ = SANDBOX2_TRACE;
   return *this;
 }
 
