@@ -40,6 +40,7 @@
 #include "sandboxed_api/sandbox2/executor.h"
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/policybuilder.h"
+#include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/sandbox2/sandbox2.h"
 #include "sandboxed_api/sandbox2/util/bpf_helper.h"
 #include "sandboxed_api/util/fileops.h"
@@ -75,6 +76,7 @@ void InitDefaultPolicyBuilder(sandbox2::PolicyBuilder* builder) {
       .AllowGetPIDs()
       .AllowSleep()
       .AllowReadlink()
+      .AllowAccess()
       .AllowSyscalls({
           __NR_recvmsg,
           __NR_sendmsg,
@@ -105,20 +107,31 @@ void Sandbox::Terminate(bool attempt_graceful_exit) {
     return;
   }
 
+  absl::StatusOr<sandbox2::Result> result;
   if (attempt_graceful_exit) {
-    // Gracefully ask it to exit (with 1 second limit) first, then kill it.
-    Exit();
-  } else {
-    // Kill it straight away
-    s2_->Kill();
+    if (absl::Status requested_exit = rpc_channel_->Exit();
+        !requested_exit.ok()) {
+      LOG(WARNING)
+          << "rpc_channel->Exit() failed, calling AwaitResultWithTimeout(1) "
+          << requested_exit;
+    }
+    result = s2_->AwaitResultWithTimeout(absl::Seconds(1));
+    if (!result.ok()) {
+      LOG(WARNING) << "s2_->AwaitResultWithTimeout failed, status: "
+                   << result.status() << " Killing PID: " << pid();
+    }
   }
 
-  const auto& result = AwaitResult();
-  if (result.final_status() == sandbox2::Result::OK &&
-      result.reason_code() == 0) {
-    VLOG(2) << "Sandbox2 finished with: " << result.ToString();
+  if (!attempt_graceful_exit || !result.ok()) {
+    s2_->Kill();
+    result = s2_->AwaitResult();
+  }
+
+  if (result->final_status() == sandbox2::Result::OK &&
+      result->reason_code() == 0) {
+    VLOG(2) << "Sandbox2 finished with: " << result->ToString();
   } else {
-    LOG(WARNING) << "Sandbox2 finished with: " << result.ToString();
+    LOG(WARNING) << "Sandbox2 finished with: " << result->ToString();
   }
 }
 
@@ -127,7 +140,7 @@ static std::string PathToSAPILib(const std::string& lib_path) {
                                         : GetDataDependencyFilePath(lib_path);
 }
 
-absl::Status Sandbox::Init() {
+absl::Status Sandbox::Init(bool use_unotify_monitor) {
   // It's already initialized
   if (is_active()) {
     return absl::OkStatus();
@@ -176,6 +189,9 @@ absl::Status Sandbox::Init() {
 
     sandbox2::PolicyBuilder policy_builder;
     InitDefaultPolicyBuilder(&policy_builder);
+  if (use_unotify_monitor) {
+    policy_builder.CollectStacktracesOnSignal(false);
+  }
   auto s2p = ModifyPolicy(&policy_builder);
 
   // Spawn new process from the forkserver.
@@ -196,6 +212,9 @@ absl::Status Sandbox::Init() {
 
   s2_ = std::make_unique<sandbox2::Sandbox2>(std::move(executor),
                                              std::move(s2p), CreateNotifier());
+  if (use_unotify_monitor) {
+    SAPI_RETURN_IF_ERROR(s2_->EnableUnotifyMonitor());
+  }
   s2_awaited_ = false;
   auto res = s2_->RunAsync();
 
@@ -306,6 +325,14 @@ absl::Status Sandbox::Call(const std::string& func, v::Callable* ret,
   // Copy all arguments into rfcall.
   int i = 0;
   for (auto* arg : args) {
+    if (arg == nullptr) {
+      rfcall.arg_type[i] = v::Type::kPointer;
+      rfcall.arg_size[i] = sizeof(void*);
+      rfcall.args[i].arg_int = 0;
+      VLOG(1) << "CALL ARG: (" << i << "): nullptr";
+      ++i;
+      continue;
+    }
     rfcall.arg_size[i] = arg->GetSize();
     rfcall.arg_type[i] = arg->GetType();
 
@@ -339,7 +366,6 @@ absl::Status Sandbox::Call(const std::string& func, v::Callable* ret,
       }
       rfcall.args[i].arg_int = fd->GetRemoteFd();
     }
-
     VLOG(1) << "CALL ARG: (" << i << "), Type: " << arg->GetTypeString()
             << ", Size: " << arg->GetSize() << ", Val: " << arg->ToString();
     ++i;
@@ -364,7 +390,9 @@ absl::Status Sandbox::Call(const std::string& func, v::Callable* ret,
 
   // Synchronize all pointers after the call if it's needed.
   for (auto* arg : args) {
-    SAPI_RETURN_IF_ERROR(SynchronizePtrAfter(arg));
+    if (arg != nullptr) {
+      SAPI_RETURN_IF_ERROR(SynchronizePtrAfter(arg));
+    }
   }
 
   VLOG(1) << "CALL EXIT: Type: " << ret->GetTypeString()

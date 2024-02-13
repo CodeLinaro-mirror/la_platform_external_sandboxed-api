@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
@@ -18,56 +19,15 @@
 
 namespace sandbox2 {
 
-// Type of a given syscall argument. Used with argument conversion routines.
-enum ArgType {
-  kGen = 1,
-  kInt,
-  kPath,
-  kHex,
-  kOct,
-  kSocketCall,
-  kSocketCallPtr,
-  kSignal,
-  kString,
-  kAddressFamily,
-  kSockaddr,
-  kSockmsghdr,
-  kCloneFlag,
-};
-
-// Single syscall definition
-struct SyscallTable::Entry {
-  // Returns the number of arguments which given syscall takes.
-  int GetNumArgs() const {
-    if (num_args < 0 || num_args > syscalls::kMaxArgs) {
-      return syscalls::kMaxArgs;
-    }
-    return num_args;
-  }
-
-  static std::string GetArgumentDescription(uint64_t value, ArgType type,
-                                            pid_t pid);
-
-  static constexpr bool BySyscallNr(const SyscallTable::Entry& a,
-                                    const SyscallTable::Entry& b) {
-    return a.nr < b.nr;
-  }
-
-  int nr;
-  absl::string_view name;
-  int num_args;
-  std::array<ArgType, syscalls::kMaxArgs> arg_types;
-};
-
 std::string SyscallTable::Entry::GetArgumentDescription(uint64_t value,
-                                                        ArgType type,
+                                                        syscalls::ArgType type,
                                                         pid_t pid) {
   std::string ret = absl::StrFormat("%#x", value);
   switch (type) {
-    case kOct:
+    case syscalls::kOct:
       absl::StrAppendFormat(&ret, " [\\0%o]", value);
       break;
-    case kPath:
+    case syscalls::kPath:
       if (auto path_or = util::ReadCPathFromPid(pid, value); path_or.ok()) {
         absl::StrAppendFormat(&ret, " ['%s']",
                               absl::CHexEscape(path_or.value()));
@@ -75,7 +35,7 @@ std::string SyscallTable::Entry::GetArgumentDescription(uint64_t value,
         absl::StrAppend(&ret, " [unreadable path]");
       }
       break;
-    case kInt:
+    case syscalls::kInt:
       absl::StrAppendFormat(&ret, " [%d]", value);
       break;
     default:
@@ -85,14 +45,11 @@ std::string SyscallTable::Entry::GetArgumentDescription(uint64_t value,
 }
 
 absl::string_view SyscallTable::GetName(int syscall) const {
-  auto it = absl::c_lower_bound(
-      data_, syscall, [](const SyscallTable::Entry& entry, int syscall) {
-        return entry.nr < syscall;
-      });
-  if (it == data_.end() || it->nr != syscall) {
+  auto entry = GetEntry(syscall);
+  if (!entry.ok()) {
     return "";
   }
-  return it->name;
+  return entry->name;
 }
 
 namespace {
@@ -108,32 +65,61 @@ constexpr SyscallTable::Entry MakeEntry(int nr, absl::string_view name,
 struct UnknownArguments {};
 constexpr SyscallTable::Entry MakeEntry(int nr, absl::string_view name,
                                         UnknownArguments) {
-  return {nr, name, -1, {kGen, kGen, kGen, kGen, kGen, kGen}};
+  return {nr,
+          name,
+          -1,
+          {syscalls::kGen, syscalls::kGen, syscalls::kGen, syscalls::kGen,
+           syscalls::kGen, syscalls::kGen}};
 }
 
 }  // namespace
+
+absl::StatusOr<SyscallTable::Entry> SyscallTable::GetEntry(int syscall) const {
+  auto it = absl::c_lower_bound(
+      data_, syscall, [](const SyscallTable::Entry& entry, int syscall) {
+        return entry.nr < syscall;
+      });
+  if (it == data_.end() || it->nr != syscall) {
+    return absl::NotFoundError(absl::StrCat("Syscall not found: ", syscall));
+  }
+  return *it;
+}
+
+absl::StatusOr<SyscallTable::Entry> SyscallTable::GetEntry(
+    absl::string_view name) const {
+  // Note: There's no uniqueness guarantee of syscall names in the table, but
+  // other than typos it's likely safe to assume uniqueness.
+  auto filter = [name](const SyscallTable::Entry& entry) {
+    return entry.name == name;
+  };
+  auto it = absl::c_find_if(data_, filter);
+  if (it != data_.end()) {
+    return *it;
+  } else {
+    return absl::NotFoundError(absl::StrCat("Name not found: ", name));
+  }
+}
 
 std::vector<std::string> SyscallTable::GetArgumentsDescription(
     int syscall, const uint64_t values[], pid_t pid) const {
   static SyscallTable::Entry kInvalidEntry =
       MakeEntry(-1, "", UnknownArguments());
-  auto it = absl::c_lower_bound(
-      data_, syscall, [](const SyscallTable::Entry& entry, int syscall) {
-        return entry.nr < syscall;
-      });
-  const auto& entry =
-      it != data_.end() && it->nr == syscall ? *it : kInvalidEntry;
+  auto entry = GetEntry(syscall);
+  if (!entry.ok()) {
+    entry = kInvalidEntry;
+  }
 
-  int num_args = entry.GetNumArgs();
+  int num_args = entry->GetNumArgs();
   std::vector<std::string> rv;
   rv.reserve(num_args);
   for (int i = 0; i < num_args; ++i) {
     rv.push_back(SyscallTable::Entry::GetArgumentDescription(
-        values[i], entry.arg_types[i], pid));
+        values[i], entry->arg_types[i], pid));
   }
   return rv;
 }
 
+namespace syscalls {
 namespace {
 
 // TODO(C++20) Use std::is_sorted
@@ -494,6 +480,33 @@ constexpr std::array kSyscallDataX8664 = {
     MakeEntry(332, "statx", kInt, kPath, kHex, kHex, kHex),
     MakeEntry(333, "io_pgetevents", UnknownArguments()),
     MakeEntry(334, "rseq", kHex, kInt, kHex, kHex),
+    MakeEntry(435, "clone3", kHex, kInt),
+    MakeEntry(436, "close_range", kInt, kInt, kHex),
+    MakeEntry(437, "openat2", kInt, kPath, kHex, kInt),
+    MakeEntry(438, "pidfd_getfd", UnknownArguments()),
+    MakeEntry(439, "faccessat2", kInt, kPath, kHex, kHex),
+    MakeEntry(440, "process_madvise", UnknownArguments()),
+    MakeEntry(441, "epoll_pwait2", UnknownArguments()),
+    MakeEntry(442, "mount_setattr", UnknownArguments()),
+    MakeEntry(443, "quotactl_fd", UnknownArguments()),
+    MakeEntry(444, "landlock_create_ruleset", UnknownArguments()),
+    MakeEntry(445, "landlock_add_rule", UnknownArguments()),
+    MakeEntry(446, "landlock_restrict_self", UnknownArguments()),
+    MakeEntry(447, "memfd_secret", UnknownArguments()),
+    MakeEntry(448, "process_mrelease", UnknownArguments()),
+    MakeEntry(449, "futex_waitv", UnknownArguments()),
+    MakeEntry(450, "set_mempolicy_home_node", UnknownArguments()),
+    MakeEntry(451, "cachestat", UnknownArguments()),
+    MakeEntry(452, "fchmodat2", kInt, kPath, kHex, kHex),
+    MakeEntry(453, "map_shadow_stack", UnknownArguments()),
+    MakeEntry(454, "futex_wake", UnknownArguments()),
+    MakeEntry(455, "futex_wait", UnknownArguments()),
+    MakeEntry(456, "futex_requeue", UnknownArguments()),
+    MakeEntry(457, "statmount", UnknownArguments()),
+    MakeEntry(458, "listmount", UnknownArguments()),
+    MakeEntry(459, "lsm_get_self_attr", UnknownArguments()),
+    MakeEntry(460, "lsm_set_self_attr", UnknownArguments()),
+    MakeEntry(461, "lsm_list_modules", UnknownArguments()),
     // clang-format on
 };
 
@@ -860,6 +873,33 @@ constexpr std::array kSyscallDataX8632 = {
     MakeEntry(355, "getrandom", kGen, kInt, kHex),
     MakeEntry(356, "memfd_create", kString, kHex),
     MakeEntry(357, "bpf", kInt, kHex, kInt),
+    MakeEntry(435, "clone3", kHex, kInt),
+    MakeEntry(436, "close_range", kInt, kInt, kHex),
+    MakeEntry(437, "openat2", kInt, kPath, kHex, kInt),
+    MakeEntry(438, "pidfd_getfd", UnknownArguments()),
+    MakeEntry(439, "faccessat2", kInt, kPath, kHex, kHex),
+    MakeEntry(440, "process_madvise", UnknownArguments()),
+    MakeEntry(441, "epoll_pwait2", UnknownArguments()),
+    MakeEntry(442, "mount_setattr", UnknownArguments()),
+    MakeEntry(443, "quotactl_fd", UnknownArguments()),
+    MakeEntry(444, "landlock_create_ruleset", UnknownArguments()),
+    MakeEntry(445, "landlock_add_rule", UnknownArguments()),
+    MakeEntry(446, "landlock_restrict_self", UnknownArguments()),
+    MakeEntry(447, "memfd_secret", UnknownArguments()),
+    MakeEntry(448, "process_mrelease", UnknownArguments()),
+    MakeEntry(449, "futex_waitv", UnknownArguments()),
+    MakeEntry(450, "set_mempolicy_home_node", UnknownArguments()),
+    MakeEntry(451, "cachestat", UnknownArguments()),
+    MakeEntry(452, "fchmodat2", kInt, kPath, kHex, kHex),
+    MakeEntry(453, "map_shadow_stack", UnknownArguments()),
+    MakeEntry(454, "futex_wake", UnknownArguments()),
+    MakeEntry(455, "futex_wait", UnknownArguments()),
+    MakeEntry(456, "futex_requeue", UnknownArguments()),
+    MakeEntry(457, "statmount", UnknownArguments()),
+    MakeEntry(458, "listmount", UnknownArguments()),
+    MakeEntry(459, "lsm_get_self_attr", UnknownArguments()),
+    MakeEntry(460, "lsm_set_self_attr", UnknownArguments()),
+    MakeEntry(461, "lsm_list_modules", UnknownArguments()),
     // clang-format on
 };
 
@@ -1239,6 +1279,32 @@ constexpr std::array kSyscallDataPPC64LE = {
     MakeEntry(379, "copy_file_range", kInt, kHex, kInt, kHex, kInt, kHex),
     MakeEntry(380, "preadv2", kInt, kHex, kInt, kInt, kInt, kHex),
     MakeEntry(381, "pwritev2", kInt, kHex, kInt, kInt, kInt, kHex),
+    MakeEntry(435, "clone3", kHex, kInt),
+    MakeEntry(436, "close_range", kInt, kInt, kHex),
+    MakeEntry(437, "openat2", kInt, kPath, kHex, kInt),
+    MakeEntry(438, "pidfd_getfd", UnknownArguments()),
+    MakeEntry(439, "faccessat2", kInt, kPath, kHex, kHex),
+    MakeEntry(440, "process_madvise", UnknownArguments()),
+    MakeEntry(441, "epoll_pwait2", UnknownArguments()),
+    MakeEntry(442, "mount_setattr", UnknownArguments()),
+    MakeEntry(443, "quotactl_fd", UnknownArguments()),
+    MakeEntry(444, "landlock_create_ruleset", UnknownArguments()),
+    MakeEntry(445, "landlock_add_rule", UnknownArguments()),
+    MakeEntry(446, "landlock_restrict_self", UnknownArguments()),
+    MakeEntry(448, "process_mrelease", UnknownArguments()),
+    MakeEntry(449, "futex_waitv", UnknownArguments()),
+    MakeEntry(450, "set_mempolicy_home_node", UnknownArguments()),
+    MakeEntry(451, "cachestat", UnknownArguments()),
+    MakeEntry(452, "fchmodat2", kInt, kPath, kHex, kHex),
+    MakeEntry(453, "map_shadow_stack", UnknownArguments()),
+    MakeEntry(454, "futex_wake", UnknownArguments()),
+    MakeEntry(455, "futex_wait", UnknownArguments()),
+    MakeEntry(456, "futex_requeue", UnknownArguments()),
+    MakeEntry(457, "statmount", UnknownArguments()),
+    MakeEntry(458, "listmount", UnknownArguments()),
+    MakeEntry(459, "lsm_get_self_attr", UnknownArguments()),
+    MakeEntry(460, "lsm_set_self_attr", UnknownArguments()),
+    MakeEntry(461, "lsm_list_modules", UnknownArguments()),
     // clang-format on
 };
 
@@ -1520,6 +1586,32 @@ constexpr std::array kSyscallDataArm64 = {
     MakeEntry(285, "copy_file_range", kInt, kHex, kInt, kHex, kInt, kHex),
     MakeEntry(286, "preadv2", kInt, kHex, kInt, kInt, kInt, kHex),
     MakeEntry(287, "pwritev2", kInt, kHex, kInt, kInt, kInt, kHex),
+    MakeEntry(435, "clone3", kHex, kInt),
+    MakeEntry(436, "close_range", kInt, kInt, kHex),
+    MakeEntry(437, "openat2", kInt, kPath, kHex, kInt),
+    MakeEntry(438, "pidfd_getfd", UnknownArguments()),
+    MakeEntry(439, "faccessat2", kInt, kPath, kHex, kHex),
+    MakeEntry(440, "process_madvise", UnknownArguments()),
+    MakeEntry(441, "epoll_pwait2", UnknownArguments()),
+    MakeEntry(442, "mount_setattr", UnknownArguments()),
+    MakeEntry(443, "quotactl_fd", UnknownArguments()),
+    MakeEntry(444, "landlock_create_ruleset", UnknownArguments()),
+    MakeEntry(445, "landlock_add_rule", UnknownArguments()),
+    MakeEntry(446, "landlock_restrict_self", UnknownArguments()),
+    MakeEntry(448, "process_mrelease", UnknownArguments()),
+    MakeEntry(449, "futex_waitv", UnknownArguments()),
+    MakeEntry(450, "set_mempolicy_home_node", UnknownArguments()),
+    MakeEntry(451, "cachestat", UnknownArguments()),
+    MakeEntry(452, "fchmodat2", kInt, kPath, kHex, kHex),
+    MakeEntry(453, "map_shadow_stack", UnknownArguments()),
+    MakeEntry(454, "futex_wake", UnknownArguments()),
+    MakeEntry(455, "futex_wait", UnknownArguments()),
+    MakeEntry(456, "futex_requeue", UnknownArguments()),
+    MakeEntry(457, "statmount", UnknownArguments()),
+    MakeEntry(458, "listmount", UnknownArguments()),
+    MakeEntry(459, "lsm_get_self_attr", UnknownArguments()),
+    MakeEntry(460, "lsm_set_self_attr", UnknownArguments()),
+    MakeEntry(461, "lsm_list_modules", UnknownArguments()),
     // clang-format on
 };
 
@@ -1877,6 +1969,32 @@ constexpr std::array kSyscallDataArm32 = {
     MakeEntry(393, "pwritev2", kInt, kHex, kInt, kInt, kInt, kHex),
     MakeEntry(400, "migrate_pages", kGen, kGen, kGen, kGen),
     MakeEntry(401, "kexec_file_load", kInt, kInt, kInt, kString, kHex),
+    MakeEntry(435, "clone3", kHex, kInt),
+    MakeEntry(436, "close_range", kInt, kInt, kHex),
+    MakeEntry(437, "openat2", kInt, kPath, kHex, kInt),
+    MakeEntry(438, "pidfd_getfd", UnknownArguments()),
+    MakeEntry(439, "faccessat2", kInt, kPath, kHex, kHex),
+    MakeEntry(440, "process_madvise", UnknownArguments()),
+    MakeEntry(441, "epoll_pwait2", UnknownArguments()),
+    MakeEntry(442, "mount_setattr", UnknownArguments()),
+    MakeEntry(443, "quotactl_fd", UnknownArguments()),
+    MakeEntry(444, "landlock_create_ruleset", UnknownArguments()),
+    MakeEntry(445, "landlock_add_rule", UnknownArguments()),
+    MakeEntry(446, "landlock_restrict_self", UnknownArguments()),
+    MakeEntry(448, "process_mrelease", UnknownArguments()),
+    MakeEntry(449, "futex_waitv", UnknownArguments()),
+    MakeEntry(450, "set_mempolicy_home_node", UnknownArguments()),
+    MakeEntry(451, "cachestat", UnknownArguments()),
+    MakeEntry(452, "fchmodat2", kInt, kPath, kHex, kHex),
+    MakeEntry(453, "map_shadow_stack", UnknownArguments()),
+    MakeEntry(454, "futex_wake", UnknownArguments()),
+    MakeEntry(455, "futex_wait", UnknownArguments()),
+    MakeEntry(456, "futex_requeue", UnknownArguments()),
+    MakeEntry(457, "statmount", UnknownArguments()),
+    MakeEntry(458, "listmount", UnknownArguments()),
+    MakeEntry(459, "lsm_get_self_attr", UnknownArguments()),
+    MakeEntry(460, "lsm_set_self_attr", UnknownArguments()),
+    MakeEntry(461, "lsm_list_modules", UnknownArguments()),
     MakeEntry(0xf0001, "ARM_breakpoint", kHex, kHex, kHex, kHex),
     MakeEntry(0xf0002, "ARM_cacheflush", kHex, kHex, kHex, kHex),
     MakeEntry(0xf0003, "ARM_usr26", kHex, kHex, kHex, kHex),
@@ -1889,19 +2007,20 @@ static_assert(IsSorted(kSyscallDataArm32, SyscallTable::Entry::BySyscallNr),
               "Syscalls should be sorted");
 
 }  // namespace
+}  // namespace syscalls
 
 SyscallTable SyscallTable::get(sapi::cpu::Architecture arch) {
   switch (arch) {
     case sapi::cpu::kX8664:
-      return SyscallTable(kSyscallDataX8664);
+      return SyscallTable(syscalls::kSyscallDataX8664);
     case sapi::cpu::kX86:
-      return SyscallTable(kSyscallDataX8632);
+      return SyscallTable(syscalls::kSyscallDataX8632);
     case sapi::cpu::kPPC64LE:
-      return SyscallTable(kSyscallDataPPC64LE);
+      return SyscallTable(syscalls::kSyscallDataPPC64LE);
     case sapi::cpu::kArm64:
-      return SyscallTable(kSyscallDataArm64);
+      return SyscallTable(syscalls::kSyscallDataArm64);
     case sapi::cpu::kArm:
-      return SyscallTable(kSyscallDataArm32);
+      return SyscallTable(syscalls::kSyscallDataArm32);
     default:
       return SyscallTable();
   }
