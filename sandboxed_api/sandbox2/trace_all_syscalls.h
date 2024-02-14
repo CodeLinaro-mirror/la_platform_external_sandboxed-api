@@ -1,4 +1,4 @@
-// Copyright 2019 Google LLC
+// Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-syntax = "proto3";
+#ifndef SANDBOXED_API_SANDBOX2_TRACE_ALL_SYSCALLS_H_
+#define SANDBOXED_API_SANDBOX2_TRACE_ALL_SYSCALLS_H_
 
-package sandbox2;
+namespace sandbox2 {
 
-message LogMessage {
-  optional int32 severity = 1;
-  optional string path = 2;
-  optional int32 line = 3;
-  optional bytes message = 4;
-  optional int32 pid = 5;
-}
+class TraceAllSyscalls {
+ public:
+  explicit TraceAllSyscalls() = default;
+};
+
+}  // namespace sandbox2
+
+#endif  // SANDBOXED_API_SANDBOX2_ALLOW_ALL_SYSCALLS_H_
