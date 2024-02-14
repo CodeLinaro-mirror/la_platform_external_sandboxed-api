@@ -26,6 +26,15 @@ target_link_libraries(sandbox2_allow_all_syscalls PRIVATE
   sapi::base
 )
 
+# sandboxed_api/sandbox2:trace_all_syscalls
+add_library(sandbox2_trace_all_syscalls ${SAPI_LIB_TYPE}
+  trace_all_syscalls.h
+)
+add_library(sandbox2::trace_all_syscalls ALIAS sandbox2_trace_all_syscalls)
+target_link_libraries(sandbox2_trace_all_syscalls PRIVATE
+  sapi::base
+)
+
 # sandboxed_api/sandbox2:allow_unrestricted_networking
 add_library(sandbox2_allow_unrestricted_networking ${SAPI_LIB_TYPE}
   allow_unrestricted_networking.h
@@ -194,7 +203,6 @@ target_link_libraries(sandbox2_notify
          sandbox2::syscall
          sandbox2::util
   PRIVATE sapi::base
-          sapi::config
 )
 
 # sandboxed_api/sandbox2:limits
@@ -422,6 +430,7 @@ target_link_libraries(sandbox2_monitor_base
           sandbox2::executor
           sandbox2::fork_client
           sandbox2::ipc
+          sandbox2::network_proxy_client
           sandbox2::network_proxy_server
           sandbox2::notify
           sandbox2::policy
@@ -994,6 +1003,7 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
     sandbox2::comms
     sandbox2::regs
     sandbox2::sandbox2
+    sandbox2::trace_all_syscalls
     sapi::testing
     sapi::test_main
   )
@@ -1039,6 +1049,7 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
   )
   add_dependencies(sandbox2_sandbox2_test
     sandbox2::testcase_abort
+    sandbox2::testcase_custom_fork
     sandbox2::testcase_minimal
     sandbox2::testcase_sleep
     sandbox2::testcase_tsync
@@ -1050,6 +1061,7 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
     absl::synchronization
     absl::time
     sapi::config
+    sandbox2::fork_client
     sandbox2::sandbox2
     sapi::testing
     sapi::status_matchers
