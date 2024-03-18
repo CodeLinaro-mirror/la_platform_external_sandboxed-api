@@ -1,4 +1,4 @@
-// Copyright 2019 Google LLC
+// Copyright 2023 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-syntax = "proto3";
+#include "sandboxed_api/sandbox2/comms.h"
+#include "sandboxed_api/sandbox2/forkingclient.h"
+#include "sandboxed_api/util/raw_logging.h"
 
-package sandbox2;
+int main(int argc, char* argv[]) {
+  sandbox2::Comms comms(sandbox2::Comms::kDefaultConnection);
+  sandbox2::ForkingClient s2client(&comms);
 
-message LogMessage {
-  optional int32 severity = 1;
-  optional string path = 2;
-  optional int32 line = 3;
-  optional bytes message = 4;
-  optional int32 pid = 5;
+  for (;;) {
+    pid_t pid = s2client.WaitAndFork();
+    if (pid == -1) {
+      SAPI_RAW_LOG(FATAL, "Could not spawn a new sandboxee");
+    }
+    if (pid == 0) {
+      // Start sandboxing here
+      s2client.SandboxMeHere();
+      return 0;
+    }
+  }
 }
