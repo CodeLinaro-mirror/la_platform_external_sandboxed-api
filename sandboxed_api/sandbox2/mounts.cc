@@ -283,8 +283,9 @@ absl::Status Mounts::Insert(absl::string_view path,
 
   MountTree* curtree = &mount_tree_;
   for (int i = 0; true; ++i) {
+    // ANDROID: std::string_view to std::string
     auto [it, did_insert] =
-        curtree->mutable_entries()->emplace(parts[i], MountTree());
+        curtree->mutable_entries()->emplace(std::string(parts[i]), MountTree());
     if (did_insert) {
       it->second.set_index(++mount_index_);
     }

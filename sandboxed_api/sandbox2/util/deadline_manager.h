@@ -50,8 +50,10 @@ class DeadlineRegistration {
   DeadlineRegistration(const DeadlineRegistration&) = delete;
   DeadlineRegistration& operator=(const DeadlineRegistration&) = delete;
 
-  DeadlineRegistration(DeadlineRegistration&&) = default;
-  DeadlineRegistration& operator=(DeadlineRegistration&&) = default;
+  // ANDROID: move assignment operator of 'DeadlineRegistration' is implicitly
+  // deleted because field 'manager_' is of reference type 'DeadlineManager &'
+  DeadlineRegistration(DeadlineRegistration&&) = delete;
+  DeadlineRegistration& operator=(DeadlineRegistration&&) = delete;
 
   ~DeadlineRegistration();
 

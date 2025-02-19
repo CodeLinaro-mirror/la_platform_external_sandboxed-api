@@ -141,7 +141,7 @@ class ArgData {
     if (length_.has_value() && *length_ < sizeof(T)) {
       return absl::InternalError(absl::StrFormat(
           "specified length [%llu] is not enough for to sizeof(%s) == %llu",
-          *length_, typeid(T).name(), sizeof(T)));
+          *length_, "(struct)", sizeof(T))); // ANDROID: typeid removed, no rtti
     }
     SAPI_ASSIGN_OR_RETURN(std::vector<uint8_t> b,
                           util::ReadBytesFromPid(pid_, value_, sizeof(T)));
@@ -185,7 +185,7 @@ class ArgData {
     if (bytes.size() < sizeof(T)) {
       return absl::InternalError(absl::StrFormat(
           "bytes size [%llu] is not equal to sizeof(%s) == %llu", bytes.size(),
-          typeid(T).name(), sizeof(T)));
+          "struct", sizeof(T))); // ANDROID: typeid removed, no rtti
     }
     T t;
     memcpy(&t, bytes.data(), sizeof(T));
