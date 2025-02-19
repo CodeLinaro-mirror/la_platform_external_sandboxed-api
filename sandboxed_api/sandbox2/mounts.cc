@@ -20,6 +20,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -86,7 +87,6 @@ absl::Status ValidateInterpreter(absl::string_view interpreter) {
       "/lib64/ld64.so.2",            // PPC64
       "/lib/ld-linux-aarch64.so.1",  // AArch64
       "/lib/ld-linux-armhf.so.3",    // Arm
-      "/system/bin/linker64",        // android_arm64
   };
 
   if (!allowed_interpreters.contains(interpreter)) {
@@ -280,24 +280,24 @@ absl::Status Mounts::Insert(absl::string_view path,
 
   std::vector<absl::string_view> parts =
       absl::StrSplit(absl::StripPrefix(fixed_path, "/"), '/');
-  std::string final_part(parts.back());
-  parts.pop_back();
 
   MountTree* curtree = &mount_tree_;
-  for (absl::string_view part : parts) {
-    curtree = &(curtree->mutable_entries()
-                    ->insert({std::string(part), MountTree()})
-                    .first->second);
+  for (int i = 0; true; ++i) {
+    auto [it, did_insert] =
+        curtree->mutable_entries()->emplace(parts[i], MountTree());
+    if (did_insert) {
+      it->second.set_index(++mount_index_);
+    }
+    curtree = &it->second;
+    if (i == parts.size() - 1) {  // Final part
+      break;
+    }
     if (curtree->has_node() && curtree->node().has_file_node()) {
       return absl::FailedPreconditionError(
           absl::StrCat("Cannot insert ", path,
                        " since a file is mounted as a parent directory"));
     }
   }
-
-  curtree = &(curtree->mutable_entries()
-                  ->insert({final_part, MountTree()})
-                  .first->second);
 
   if (curtree->has_node()) {
     if (internal::IsEquivalentNode(curtree->node(), new_node)) {
@@ -586,8 +586,7 @@ uint64_t GetMountFlagsFor(const std::string& path) {
 }
 
 std::string MountFlagsToString(uint64_t flags) {
-#define SAPI_MAP(x) \
-  { x, #x }
+#define SAPI_MAP(x) {x, #x}
   static constexpr std::pair<uint64_t, absl::string_view> kMap[] = {
       SAPI_MAP(MS_RDONLY),      SAPI_MAP(MS_NOSUID),
       SAPI_MAP(MS_NODEV),       SAPI_MAP(MS_NOEXEC),
@@ -638,11 +637,24 @@ void MountWithDefaults(const std::string& source, const std::string& target,
   int res = mount(source.c_str(), target.c_str(), fs_type, flags, option_str);
   if (res == -1) {
     if (errno == ENOENT) {
-      // File does not exist (anymore). This is e.g. the case when we're trying
-      // to gather stack-traces on SAPI crashes. The sandboxee application is a
+      // File does not exist (anymore). This may be the case when trying to
+      // gather stack-traces on SAPI crashes. The sandboxee application is a
       // memfd file that is not existing anymore.
-      SAPI_RAW_LOG(WARNING, "Could not mount %s: file does not exist",
-                   source.c_str());
+      // Check which file/dir of the call is actually missing.
+      bool have_source =
+          file_util::fileops::Exists(source, /*fully_resolve=*/true);
+      bool have_target =
+          file_util::fileops::Exists(target, /*fully_resolve=*/true);
+      const char* detail = "unknown error, source and target exist";
+      if (!have_source && !have_target) {
+        detail = "neither source nor target exist";
+      } else if (!have_source) {
+        detail = "source does not exist";
+      } else if (!have_target) {
+        detail = "target does not exist";
+      }
+      SAPI_RAW_LOG(WARNING, "Could not mount %s (source) to %s (target): %s",
+                   source.c_str(), target.c_str(), detail);
       return;
     }
     SAPI_RAW_PLOG(FATAL, "mounting %s to %s failed (flags=%s)", source, target,
@@ -674,9 +686,32 @@ void MountWithDefaults(const std::string& source, const std::string& target,
   }
 }
 
+using MapEntry = std::pair<absl::string_view, const MountTree*>;
+
+std::vector<MapEntry> GetSortedEntries(const MountTree& tree) {
+  std::vector<MapEntry> ordered;
+  ordered.reserve(tree.entries_size());
+  for (auto& entry : tree.entries()) {
+    ordered.emplace_back(entry.first, &entry.second);
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [](const MapEntry& a, const MapEntry& b) {
+              return a.second->index() < b.second->index();
+            });
+  return ordered;
+}
+
+bool IsSymlink(const std::string& path) {
+  struct stat sb;
+  if (stat(path.c_str(), &sb) == -1) {
+    return false;
+  }
+  return S_ISLNK(sb.st_mode);
+}
+
 // Traverses the MountTree to create all required files and perform the mounts.
-void CreateMounts(const MountTree& tree, const std::string& path,
-                  bool create_backing_files) {
+void CreateMounts(const MountTree& tree, const std::string& root_path,
+                  const std::string& path, bool create_backing_files) {
   // First, create the backing files if needed.
   if (create_backing_files) {
     switch (tree.node().node_case()) {
@@ -695,6 +730,17 @@ void CreateMounts(const MountTree& tree, const std::string& path,
         SAPI_RAW_PCHECK(mkdir(path.c_str(), 0700) == 0 || errno == EEXIST, "");
         break;
         // Intentionally no default to make sure we handle all the cases.
+    }
+  }
+
+  if (IsSymlink(path)) {
+    std::string abs_path;
+    if (!file_util::fileops::ReadLinkAbsolute(path, &abs_path)) {
+      SAPI_RAW_LOG(WARNING, "could not resolve mount target path %s",
+                   path.c_str());
+    } else if (!absl::StartsWith(abs_path, absl::StrCat(root_path, "/"))) {
+      SAPI_RAW_LOG(ERROR, "Mount target not within chroot: %s resolved to %s",
+                   path.c_str(), abs_path.c_str());
     }
   }
 
@@ -735,16 +781,16 @@ void CreateMounts(const MountTree& tree, const std::string& path,
   }
 
   // Traverse the subtrees.
-  for (const auto& kv : tree.entries()) {
-    std::string new_path = sapi::file::JoinPath(path, kv.first);
-    CreateMounts(kv.second, new_path, create_backing_files);
+  for (const auto& [key, value] : GetSortedEntries(tree)) {
+    std::string new_path = sapi::file::JoinPath(path, key);
+    CreateMounts(*value, root_path, new_path, create_backing_files);
   }
 }
 
 }  // namespace
 
 void Mounts::CreateMounts(const std::string& root_path) const {
-  sandbox2::CreateMounts(mount_tree_, root_path, true);
+  sandbox2::CreateMounts(mount_tree_, root_path, root_path, true);
 }
 
 namespace {
@@ -768,9 +814,9 @@ void RecursivelyListMountsImpl(const MountTree& tree,
         absl::StrCat("tmpfs: ", node.tmpfs_node().tmpfs_options()));
   }
 
-  for (const auto& subentry : tree.entries()) {
-    RecursivelyListMountsImpl(subentry.second,
-                              absl::StrCat(tree_path, "/", subentry.first),
+  for (const auto& [key, value] : GetSortedEntries(tree)) {
+    std::string new_path = sapi::file::JoinPath(tree_path, key);
+    RecursivelyListMountsImpl(*value, absl::StrCat(tree_path, "/", key),
                               outside_entries, inside_entries);
   }
 }
