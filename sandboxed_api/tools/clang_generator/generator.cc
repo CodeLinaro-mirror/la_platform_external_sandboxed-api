@@ -14,8 +14,8 @@
 
 #include "sandboxed_api/tools/clang_generator/generator.h"
 
+#include <cstddef>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,11 +29,15 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Serialization/PCHContainerOperations.h"
+#include "clang/Tooling/Tooling.h"
 #include "sandboxed_api/tools/clang_generator/diagnostics.h"
-#include "sandboxed_api/tools/clang_generator/emitter.h"
+#include "sandboxed_api/tools/clang_generator/emitter_base.h"
 
 namespace sapi {
 namespace {
@@ -41,8 +45,8 @@ namespace {
 // Replaces the file extension of a path name.
 std::string ReplaceFileExtension(absl::string_view path,
                                  absl::string_view new_extension) {
-  auto last_slash = path.rfind('/');
-  auto pos = path.rfind('.', last_slash);
+  size_t last_slash = path.rfind('/');
+  size_t pos = path.rfind('.', last_slash);
   if (pos != absl::string_view::npos && last_slash != absl::string_view::npos) {
     pos += last_slash;
   }
@@ -114,11 +118,10 @@ void GeneratorASTConsumer::HandleTranslationUnit(clang::ASTContext& context) {
   if (!visitor_.TraverseDecl(context.getTranslationUnitDecl())) {
     ReportFatalError(context.getDiagnostics(),
                      context.getTranslationUnitDecl()->getBeginLoc(),
-                     "AST traversal exited early");
+                     "AST traversal exited early.");
     return;
   }
 
-  // TODO(cblichmann): Move below to emit all functions after traversing TUs.
   emitter_.AddTypeDeclarations(visitor_.collector().GetTypeDeclarations());
   for (clang::FunctionDecl* func : visitor_.functions()) {
     absl::Status status = emitter_.AddFunction(func);
@@ -146,9 +149,37 @@ bool GeneratorFactory::runInvocation(
   for (const auto& def : {
            // Enable code to detect whether it is being SAPI-ized
            "__SAPI__",
-           // TODO(b/222241644): Figure out how to deal with intrinsics properly
+           // TODO: b/222241644 - Figure out how to deal with intrinsics
+           // properly.
            // Note: The definitions below just need to parse, they don't need to
            //       compile into useful code.
+           // 3DNow!
+           "__builtin_ia32_femms=[](){}",
+           "__builtin_ia32_pavgusb=",
+           "__builtin_ia32_pf2id=",
+           "__builtin_ia32_pfacc=",
+           "__builtin_ia32_pfadd=",
+           "__builtin_ia32_pfcmpeq=",
+           "__builtin_ia32_pfcmpge=",
+           "__builtin_ia32_pfcmpgt=",
+           "__builtin_ia32_pfmax=",
+           "__builtin_ia32_pfmin=",
+           "__builtin_ia32_pfmul=",
+           "__builtin_ia32_pfrcp=",
+           "__builtin_ia32_pfrcpit1=",
+           "__builtin_ia32_pfrcpit2=",
+           "__builtin_ia32_pfrsqrt=",
+           "__builtin_ia32_pfrsqit1=",
+           "__builtin_ia32_pfsub=",
+           "__builtin_ia32_pfsubr=",
+           "__builtin_ia32_pi2fd=",
+           "__builtin_ia32_pmulhrw=",
+           "__builtin_ia32_pf2iw=",
+           "__builtin_ia32_pfnacc=",
+           "__builtin_ia32_pfpnacc=",
+           "__builtin_ia32_pi2fw=",
+           "__builtin_ia32_pswapdsf=",
+           "__builtin_ia32_pswapdsi=",
            // Intel
            "__builtin_ia32_cvtsbf162ss_32=[](auto)->long long{return 0;}",
            "__builtin_ia32_paddsb128=",
@@ -179,6 +210,115 @@ bool GeneratorFactory::runInvocation(
            "__builtin_ia32_reduce_add_q512=[](auto)->long long{return 0;}",
            "__builtin_ia32_reduce_mul_d512=[](auto)->long long{return 0;}",
            "__builtin_ia32_reduce_mul_q512=[](auto)->long long{return 0;}",
+
+           // SSE2
+           "__builtin_ia32_cvtpd2pi=[](auto)->long long{return 0;}",
+           "__builtin_ia32_cvtpi2pd=[](auto) -> __m128{return {0, 0, 0, 0};}",
+           "__builtin_ia32_cvtpi2ps=[](auto, auto)->__m128{return {0, 0, 0, "
+           "0};}",
+           "__builtin_ia32_cvtps2pi=[](auto)->long long{return 0;}",
+           "__builtin_ia32_cvttpd2pi=[](auto)->long long{return 0;}",
+           "__builtin_ia32_cvttps2pi=[](auto)->long long{return 0;}",
+           "__builtin_ia32_maskmovq=",
+           "__builtin_ia32_movntq=",
+           "__builtin_ia32_pabsb=",
+           "__builtin_ia32_pabsd=",
+           "__builtin_ia32_pabsw=",
+           "__builtin_ia32_packssdw=",
+           "__builtin_ia32_packsswb=",
+           "__builtin_ia32_packuswb=",
+           "__builtin_ia32_paddb=",
+           "__builtin_ia32_paddd=",
+           "__builtin_ia32_paddq=",
+           "__builtin_ia32_paddsb=",
+           "__builtin_ia32_paddsw=",
+           "__builtin_ia32_paddusb=",
+           "__builtin_ia32_paddusw=",
+           "__builtin_ia32_paddw=",
+           "__builtin_ia32_pand=",
+           "__builtin_ia32_pandn=",
+           "__builtin_ia32_pavgb=",
+           "__builtin_ia32_pavgw=",
+           "__builtin_ia32_pcmpeqb=",
+           "__builtin_ia32_pcmpeqd=",
+           "__builtin_ia32_pcmpeqw=",
+           "__builtin_ia32_pcmpgtb=",
+           "__builtin_ia32_pcmpgtd=",
+           "__builtin_ia32_pcmpgtw=",
+           "__builtin_ia32_phaddd=",
+           "__builtin_ia32_phaddsw=",
+           "__builtin_ia32_phaddw=",
+           "__builtin_ia32_phsubd=",
+           "__builtin_ia32_phsubsw=",
+           "__builtin_ia32_phsubw=",
+           "__builtin_ia32_pmaddubsw=",
+           "__builtin_ia32_pmaddwd=",
+           "__builtin_ia32_pmaxsw=",
+           "__builtin_ia32_pmaxub=",
+           "__builtin_ia32_pminsw=",
+           "__builtin_ia32_pminub=",
+           "__builtin_ia32_pmovmskb=[](auto)->long long{return 0;}",
+           "__builtin_ia32_pmulhrsw=",
+           "__builtin_ia32_pmulhuw=",
+           "__builtin_ia32_pmulhw=",
+           "__builtin_ia32_pmullw=",
+           "__builtin_ia32_pmuludq=",
+           "__builtin_ia32_por=",
+           "__builtin_ia32_psadbw=",
+           "__builtin_ia32_pshufb=",
+           "__builtin_ia32_psignb=",
+           "__builtin_ia32_psignd=",
+           "__builtin_ia32_psignw=",
+           "__builtin_ia32_pslld=",
+           "__builtin_ia32_pslldi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psllq=",
+           "__builtin_ia32_psllqi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psllw=",
+           "__builtin_ia32_psllwi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psrad=",
+           "__builtin_ia32_psradi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psraw=",
+           "__builtin_ia32_psrawi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psrld=",
+           "__builtin_ia32_psrldi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psrlq=",
+           "__builtin_ia32_psrlqi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psrlw=",
+           "__builtin_ia32_psrlwi=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_psubb=",
+           "__builtin_ia32_psubd=",
+           "__builtin_ia32_psubq=",
+           "__builtin_ia32_psubsb=",
+           "__builtin_ia32_psubsw=",
+           "__builtin_ia32_psubusb=",
+           "__builtin_ia32_psubusw=",
+           "__builtin_ia32_psubw=",
+           "__builtin_ia32_punpckhbw=",
+           "__builtin_ia32_punpckhdq=",
+           "__builtin_ia32_punpckhwd=",
+           "__builtin_ia32_punpcklbw=",
+           "__builtin_ia32_punpckldq=",
+           "__builtin_ia32_punpcklwd=",
+           "__builtin_ia32_pxor=",
+           "__builtin_ia32_vec_ext_v2si=",
+           "__builtin_ia32_vec_init_v2si=[](auto, auto)->long long{return 0;}",
+           "__builtin_ia32_vec_init_v4hi=[](auto, auto, auto, auto)->long "
+           "long{return 0;}",
+           "__builtin_ia32_vec_init_v8qi=[](auto, auto, auto, auto, auto, "
+           "auto, auto, auto)->long long{return 0;}",
+           // AVX
+           "__builtin_ia32_vpopcntb_128=",
+           "__builtin_ia32_vpopcntb_256=",
+           "__builtin_ia32_vpopcntb_512=",
+           "__builtin_ia32_vpopcntd_128=",
+           "__builtin_ia32_vpopcntd_256=",
+           "__builtin_ia32_vpopcntd_512=",
+           "__builtin_ia32_vpopcntq_128=",
+           "__builtin_ia32_vpopcntq_256=",
+           "__builtin_ia32_vpopcntq_512=",
+           "__builtin_ia32_vpopcntw_128=",
+           "__builtin_ia32_vpopcntw_256=",
+           "__builtin_ia32_vpopcntw_512=",
        }) {
     options.addMacroDef(def);
     // To avoid code to include header with compiler intrinsics, undefine a few

@@ -32,12 +32,14 @@
 #include "absl/strings/str_format.h"
 #include "sandboxed_api/util/strerror.h"
 
-// Exclude ABSL_RAW_LOG when running on Android because it will not be visible
-// in logcat since Android sends anything written to stdout and stderr to
-// /dev/null.
-#if defined(ABSL_RAW_LOG) && !(__ANDROID__)
+#if defined(ABSL_RAW_LOG)
 #define SAPI_RAW_LOG ABSL_RAW_LOG
+#define SAPI_USE_ABSL_RAW_LOG 1
 #else
+#define SAPI_RAW_LOGGING_INTERNAL_INFO ::absl::LogSeverity::kInfo
+#define SAPI_RAW_LOGGING_INTERNAL_WARNING ::absl::LogSeverity::kWarning
+#define SAPI_RAW_LOGGING_INTERNAL_ERROR ::absl::LogSeverity::kError
+#define SAPI_RAW_LOGGING_INTERNAL_FATAL ::absl::LogSeverity::kFatal
 // This is similar to LOG(severity) << format..., but
 // * it is to be used ONLY by low-level modules that can't use normal LOG()
 // * it is designed to be a low-level logger that does not allocate any
@@ -80,31 +82,10 @@
   } while (0)
 #endif
 
-#define SAPI_RAW_LOGGING_INTERNAL_INFO ::absl::LogSeverity::kInfo
-#define SAPI_RAW_LOGGING_INTERNAL_WARNING ::absl::LogSeverity::kWarning
-#define SAPI_RAW_LOGGING_INTERNAL_ERROR ::absl::LogSeverity::kError
-#define SAPI_RAW_LOGGING_INTERNAL_FATAL ::absl::LogSeverity::kFatal
-
-// Returns whether SAPI verbose logging is enabled, as determined by the
+// Returns whether SAPI raw verbose logging is enabled, as determined by the
 // SAPI_VLOG_LEVEL environment variable.
-#define SAPI_VLOG_IS_ON(verbose_level) \
+#define SAPI_RAW_VLOG_IS_ON(verbose_level) \
   ::sapi::raw_logging_internal::VLogIsOn(verbose_level)
-
-#define SAPI_RAW_VLOG_IS_ON(verbose_level) SAPI_VLOG_IS_ON(verbose_level)
-
-#ifndef VLOG
-// `VLOG` uses numeric levels to provide verbose logging that can configured at
-// runtime, globally. `VLOG` statements are logged at `INFO` severity if they
-// are logged at all; the numeric levels are on a different scale than the
-// proper severity levels. Positive levels are disabled by default. Negative
-// levels should not be used.
-#define VLOG(verbose_level)                                                \
-  for (int sapi_logging_internal_verbose_level = (verbose_level),          \
-           sapi_logging_internal_log_loop = 1;                             \
-       sapi_logging_internal_log_loop; sapi_logging_internal_log_loop = 0) \
-  LOG_IF(INFO, SAPI_VLOG_IS_ON(sapi_logging_internal_verbose_level))       \
-      .WithVerbosity(sapi_logging_internal_verbose_level)
-#endif
 
 // Like SAPI_RAW_LOG(), but also logs the current value of errno and its
 // corresponding error message.
@@ -148,19 +129,13 @@ namespace sapi::raw_logging_internal {
 
 constexpr int kLogBufSize = 3000;
 
+#ifndef SAPI_USE_ABSL_RAW_LOG
 // Helper function to implement ABSL_RAW_LOG
 // Logs format... at "severity" level, reporting it
 // as called from file:line.
 // This does not allocate memory or acquire locks.
 void RawLog(absl::LogSeverity severity, const char* file, int line,
             const char* format, ...) ABSL_PRINTF_ATTRIBUTE(4, 5);
-
-// Writes the provided buffer directly to stderr, in a safe, low-level manner.
-//
-// In POSIX this means calling write(), which is async-signal safe and does
-// not malloc.  If the platform supports the SYS_write syscall, we invoke that
-// directly to side-step any libc interception.
-void SafeWriteToStderr(const char* s, size_t len);
 
 // compile-time function to get the "base" filename, that is, the part of
 // a filename after the last "/" or "\" path separator.  The search starts at
@@ -170,6 +145,7 @@ constexpr const char* Basename(const char* fname, int offset) {
              ? fname + offset
              : Basename(fname, offset - 1);
 }
+#endif
 
 bool VLogIsOn(int verbose_level);
 

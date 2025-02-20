@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <string>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -25,7 +24,6 @@
 #include "absl/synchronization/mutex.h"
 #include "sandboxed_api/call.h"
 #include "sandboxed_api/sandbox2/comms.h"
-#include "sandboxed_api/util/raw_logging.h"
 #include "sandboxed_api/util/status_macros.h"
 
 namespace sapi {
@@ -45,13 +43,8 @@ absl::StatusOr<FuncRet> RPCChannel::Return(v::Type exp_type) {
   uint32_t tag;
   size_t len;
   FuncRet ret;
-  if (!comms_->RecvTLV(&tag, &len, &ret, sizeof(ret))) {
+  if (!comms_->RecvTLV(&tag, &len, &ret, sizeof(ret), comms::kMsgReturn)) {
     return absl::UnavailableError("Receiving TLV value failed");
-  }
-  if (tag != comms::kMsgReturn) {
-    LOG(ERROR) << "tag != comms::kMsgReturn (" << absl::StrCat(absl::Hex(tag))
-               << " != " << absl::StrCat(absl::Hex(comms::kMsgReturn)) << ")";
-    return absl::UnavailableError("Received TLV has incorrect tag");
   }
   if (len != sizeof(FuncRet)) {
     LOG(ERROR) << "len != sizeof(FuncReturn) (" << len

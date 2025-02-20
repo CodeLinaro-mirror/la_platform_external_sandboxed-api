@@ -15,13 +15,6 @@
 #ifndef SANDBOXED_API_SANDBOX2_TRACE_ALL_SYSCALLS_H_
 #define SANDBOXED_API_SANDBOX2_TRACE_ALL_SYSCALLS_H_
 
-namespace sandbox2 {
-
-class TraceAllSyscalls {
- public:
-  explicit TraceAllSyscalls() = default;
-};
-
-}  // namespace sandbox2
+#include "sandboxed_api/sandbox2/allowlists/trace_all_syscalls.h"  // IWYU pragma: export
 
 #endif  // SANDBOXED_API_SANDBOX2_ALLOW_ALL_SYSCALLS_H_
