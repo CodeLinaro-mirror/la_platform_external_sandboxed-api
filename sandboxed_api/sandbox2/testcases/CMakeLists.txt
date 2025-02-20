@@ -151,8 +151,27 @@ set_target_properties(sandbox2_testcase_policy PROPERTIES
 target_link_libraries(sandbox2_testcase_policy PRIVATE
   -static
   absl::core_headers
+  sandbox2::client
+  sandbox2::comms
+  sandbox2::util
   sapi::base
-  sapi::config
+)
+
+# sandboxed_api/sandbox2/testcases:sandbox_detection
+add_executable(sandbox2_testcase_sandbox_detection
+  sandbox_detection.cc
+)
+add_executable(sandbox2::testcase_policy ALIAS sandbox2_testcase_sandbox_detection)
+set_target_properties(sandbox2_testcase_sandbox_detection PROPERTIES
+  OUTPUT_NAME sandbox_detection
+)
+target_link_libraries(sandbox2_testcase_sandbox_detection PRIVATE
+  -static
+  absl::statusor
+  sandbox2::client
+  sandbox2::comms
+  sandbox2::util
+  sapi::base
 )
 
 # sandboxed_api/sandbox2/testcases:sanitizer
@@ -337,4 +356,37 @@ target_link_libraries(sandbox2_testcase_custom_fork PRIVATE
   sapi::raw_logging
 )
 
+# sandboxed_api/sandbox2/testcases:util_communicate
+add_executable(sandbox2_testcase_util_communicate
+  util_communicate.cc
+)
+add_executable(sandbox2::testcase_util_communicate ALIAS sandbox2_testcase_util_communicate)
+set_target_properties(sandbox2_testcase_util_communicate PROPERTIES
+  OUTPUT_NAME util_communicate
+)
+target_link_libraries(sandbox2_testcase_util_communicate PRIVATE
+  sapi::base
+)
 
+# sandboxed_api/sandbox2/testcases:posix_timers
+add_executable(sandbox2_testcase_posix_timers
+  posix_timers.cc
+)
+add_executable(sandbox2::testcase_posix_timers ALIAS sandbox2_testcase_posix_timers)
+set_target_properties(sandbox2_testcase_posix_timers PROPERTIES
+  OUTPUT_NAME posix_timers
+)
+target_link_libraries(sandbox2_testcase_posix_timers PRIVATE
+  -static
+  -lrt
+  absl::check
+  absl::flags
+  absl::flags_parse
+  absl::log
+  absl::log_globals
+  absl::log_initialize
+  absl::log_severity
+  absl::strings
+  absl::time
+  sapi::base
+)

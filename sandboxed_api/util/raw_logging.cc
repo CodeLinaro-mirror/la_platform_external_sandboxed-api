@@ -14,23 +14,24 @@
 
 #include "sandboxed_api/util/raw_logging.h"
 
-#include <syscall.h>
 #include <unistd.h>
+
+#include <cstdlib>
+#include <limits>
+
+#include "absl/strings/numbers.h"
+
+#ifndef SAPI_USE_ABSL_RAW_LOG
+#include <syscall.h>
 
 #include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <limits>
 
 #include "absl/base/attributes.h"
 #include "absl/base/log_severity.h"
-#include "absl/strings/numbers.h"
 
-#ifdef __ANDROID__
-#include "android/log.h"
-#endif
-
+namespace {
 static const char kTruncated[] = " ... (message truncated)\n";
 
 // sprintf the format to the buffer, adjusting *buf and *size to reflect the
@@ -56,8 +57,6 @@ inline static bool VADoRawLog(char** buf, int* size, const char* format,
   return result;
 }
 
-namespace {
-
 // CAVEAT: vsnprintf called from *DoRawLog below has some (exotic) code paths
 // that invoke malloc() and getenv() that might acquire some locks.
 
@@ -77,22 +76,14 @@ bool DoRawLog(char** buf, int* size, const char* format, ...) {
   return true;
 }
 
-#ifdef __ANDROID__
-android_LogPriority ConvertSeverity(absl::LogSeverity severity) {
-  switch (severity) {
-    case absl::LogSeverity::kInfo:
-      return ANDROID_LOG_INFO;
-    case absl::LogSeverity::kWarning:
-      return ANDROID_LOG_WARN;
-    case absl::LogSeverity::kError:
-      return ANDROID_LOG_ERROR;
-    case absl::LogSeverity::kFatal:
-      return ANDROID_LOG_FATAL;
-    default:
-      return ANDROID_LOG_INFO;
-  }
+// Writes the provided buffer directly to stderr, in a safe, low-level manner.
+//
+// In POSIX this means calling write(), which is async-signal safe and does
+// not malloc.  If the platform supports the SYS_write syscall, we invoke that
+// directly to side-step any libc interception.
+void SafeWriteToStderr(const char* s, size_t len) {
+  syscall(SYS_write, STDERR_FILENO, s, len);
 }
-#endif
 
 void RawLogVA(absl::LogSeverity severity, const char* file, int line,
               const char* format, va_list ap) ABSL_PRINTF_ATTRIBUTE(4, 0);
@@ -110,13 +101,8 @@ void RawLogVA(absl::LogSeverity severity, const char* file, int line,
   } else {
     DoRawLog(&buf, &size, "%s", kTruncated);
   }
-#ifndef __ANDROID__
-  sapi::raw_logging_internal::SafeWriteToStderr(buffer, strlen(buffer));
-#else
-  // Logs to Android's logcat with the TAG SAPI and the log line containing
-  // the code location and the log output.
-  __android_log_print(ConvertSeverity(severity), "SAPI", "%s", buffer);
-#endif
+
+  SafeWriteToStderr(buffer, strlen(buffer));
 
   // Abort the process after logging a FATAL message, even if the output itself
   // was suppressed.
@@ -126,9 +112,11 @@ void RawLogVA(absl::LogSeverity severity, const char* file, int line,
 }
 
 }  // namespace
+#endif
 
 namespace sapi::raw_logging_internal {
 
+#ifndef SAPI_USE_ABSL_RAW_LOG
 void RawLog(absl::LogSeverity severity, const char* file, int line,
             const char* format, ...) ABSL_PRINTF_ATTRIBUTE(4, 5);
 void RawLog(absl::LogSeverity severity, const char* file, int line,
@@ -138,10 +126,7 @@ void RawLog(absl::LogSeverity severity, const char* file, int line,
   RawLogVA(severity, file, line, format, ap);
   va_end(ap);
 }
-
-void SafeWriteToStderr(const char* s, size_t len) {
-  syscall(SYS_write, STDERR_FILENO, s, len);
-}
+#endif
 
 bool VLogIsOn(int verbose_level) {
   static int external_verbose_level = [] {

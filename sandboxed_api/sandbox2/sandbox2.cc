@@ -107,21 +107,15 @@ void Sandbox2::Launch() {
     internal::SandboxPeer::spawn_fn_ = Sandbox2Peer::Spawn;
   });
 
-  // This is a technical limitation in our stack trace collection
-  // functionality.
-  LOG_IF(WARNING, !policy_->GetNamespace())
-      << "Using policy without namespaces, disabling stack traces on crash";
-
   monitor_ = CreateMonitor();
   monitor_->Launch();
 }
 
 absl::Status Sandbox2::EnableUnotifyMonitor() {
   if (notify_) {
-    LOG(WARNING) << "Running UnotifyMonitor with sandbox2::Notify is not fully "
-                    "supported. Runtime syscall decisions via "
-                    "EventSyscallTrap/EventSyscallTrace, notifications about "
-                    "signals via EventSignal will not work";
+    LOG(WARNING) << "Using unotify monitor with experimental support for "
+                    "notifications. Notifications about signals via "
+                    "EventSignal will not work.";
   }
   if (!policy_->GetNamespace()) {
     return absl::FailedPreconditionError(

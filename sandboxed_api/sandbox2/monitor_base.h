@@ -24,10 +24,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
-#include <thread>
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
@@ -42,6 +42,7 @@
 #include "sandboxed_api/sandbox2/regs.h"
 #include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/sandbox2/syscall.h"
+#include "sandboxed_api/util/thread.h"
 
 namespace sandbox2 {
 
@@ -64,6 +65,9 @@ class MonitorBase {
   // Enable network proxy server, this will start a thread in the sandbox
   // that waits for connection requests from the sandboxee.
   void EnableNetworkProxyServer();
+
+  // Notifies the monitor that a network violation occurred.
+  virtual void NotifyNetworkViolation() = 0;
 
   pid_t pid() const { return process_.main_pid; }
 
@@ -115,8 +119,14 @@ class MonitorBase {
   // Monitor type
   MonitorType type_ = FORKSERVER_MONITOR_PTRACE;
 
- private:
+ protected:
   // Sends Policy to the Client.
+  // Can be overridden by subclasses to save/modify policy before sending.
+  // Returns success/failure status.
+  virtual absl::Status SendPolicy(const std::vector<sock_filter>& policy);
+
+ private:
+  // Instantiates and sends Policy to the Client.
   // Returns success/failure status.
   bool InitSendPolicy();
 
@@ -154,7 +164,7 @@ class MonitorBase {
   // active.
   std::string comms_fd_dev_;
 
-  std::thread network_proxy_thread_;
+  sapi::Thread network_proxy_thread_;
 
   // Is the sandboxee forked from a custom forkserver?
   bool uses_custom_forkserver_;
