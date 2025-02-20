@@ -6,7 +6,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pwd.h>
-#include <sys/poll.h>
+#include <poll.h> // ANDROID: changed from sys/poll.h
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>

@@ -28,13 +28,12 @@ cc_defaults {
 cc_library {
     name: "sandboxed_api_proto",
     srcs: [
-        "sandboxed_api/proto_arg.proto",
         "sandboxed_api/sandbox2/comms_test.proto",
         "sandboxed_api/sandbox2/forkserver.proto",
         "sandboxed_api/sandbox2/logserver.proto",
         "sandboxed_api/sandbox2/mount_tree.proto",
-        "sandboxed_api/sandbox2/violation.proto",
         "sandboxed_api/sandbox2/unwind/unwind.proto",
+        "sandboxed_api/util/proto_arg.proto",
         "sandboxed_api/util/status.proto",
     ],
     proto: {
@@ -108,6 +107,7 @@ cc_library {
         "android/unwind.cc",
         "sandboxed_api/config.cc",
         "sandboxed_api/sandbox2/bpfdisassembler.cc",
+        "sandboxed_api/sandbox2/bpf_evaluator.cc",
         "sandboxed_api/sandbox2/buffer.cc",
         "sandboxed_api/sandbox2/client.cc",
         "sandboxed_api/sandbox2/comms.cc",
@@ -128,8 +128,10 @@ cc_library {
         "sandboxed_api/sandbox2/unwind/unwind.cc",
         "sandboxed_api/sandbox2/util.cc",
         "sandboxed_api/sandbox2/util/bpf_helper.c",
+        "sandboxed_api/sandbox2/util/deadline_manager.cc",
         "sandboxed_api/sandbox2/util/maps_parser.cc",
         "sandboxed_api/sandbox2/util/minielf.cc",
+        "sandboxed_api/sandbox2/util/pid_waiter.cc",
         "sandboxed_api/sandbox2/util/syscall_trap.cc",
         "sandboxed_api/util/temp_file.cc",
     ],
