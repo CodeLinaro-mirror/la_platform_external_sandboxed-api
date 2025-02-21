@@ -37,6 +37,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "sandboxed_api/config.h"
+#include "sandboxed_api/sandbox2/bpf_evaluator.h"
 #include "sandboxed_api/sandbox2/client.h"
 #include "sandboxed_api/sandbox2/executor.h"
 #include "sandboxed_api/sandbox2/forkserver.pb.h"
@@ -46,7 +47,17 @@
 #include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/util/fileops.h"
 #include "sandboxed_api/util/status_macros.h"
-#include "sandboxed_api/util/raw_logging.h"
+#include "sandboxed_api/util/thread.h"
+
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF 0x7fc00000U /* notifies userspace */
+#endif
+
+#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
+#define SECCOMP_USER_NOTIF_FLAG_CONTINUE 1
+#endif
+
+#define DO_USER_NOTIF BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF)
 
 #ifndef SECCOMP_GET_NOTIF_SIZES
 #define SECCOMP_GET_NOTIF_SIZES 3
@@ -65,8 +76,9 @@ struct seccomp_notif_sizes {
 #define SECCOMP_IOWR(nr, type) _IOWR(SECCOMP_IOC_MAGIC, nr, type)
 #endif
 
-/* Flags for seccomp notification fd ioctl. */
+// Flags for seccomp notification fd ioctl.
 #define SECCOMP_IOCTL_NOTIF_RECV SECCOMP_IOWR(0, struct seccomp_notif)
+#define SECCOMP_IOCTL_NOTIF_SEND SECCOMP_IOWR(1, struct seccomp_notif_resp)
 #endif
 
 namespace sandbox2 {
@@ -162,12 +174,58 @@ UnotifyMonitor::UnotifyMonitor(Executor* executor, Policy* policy,
 }
 
 void UnotifyMonitor::RunInternal() {
-  thread_ = std::make_unique<std::thread>(&UnotifyMonitor::Run, this);
+  thread_ = sapi::Thread(this, &UnotifyMonitor::Run, "sandbox2-Monitor");
 
   // Wait for the Monitor to set-up the sandboxee correctly (or fail while
   // doing that). From here on, it is safe to use the IPC object for
   // non-sandbox-related data exchange.
   setup_notification_.WaitForNotification();
+}
+
+absl::Status UnotifyMonitor::SendPolicy(
+    const std::vector<sock_filter>& policy) {
+  original_policy_ = policy;
+  std::vector<sock_filter> modified_policy = policy;
+  const sock_filter trace_action = SANDBOX2_TRACE;
+  for (sock_filter& filter : modified_policy) {
+    if ((filter.code == BPF_RET + BPF_K && filter.k == SECCOMP_RET_KILL) ||
+        (filter.code == trace_action.code && filter.k == trace_action.k)) {
+      filter = DO_USER_NOTIF;
+    }
+  }
+  return MonitorBase::SendPolicy(modified_policy);
+}
+
+void UnotifyMonitor::HandleViolation(const Syscall& syscall) {
+  ViolationType violation_type = syscall.arch() == Syscall::GetHostArch()
+                                     ? ViolationType::kSyscall
+                                     : ViolationType::kArchitectureSwitch;
+  LogSyscallViolation(syscall);
+  notify_->EventSyscallViolation(syscall, violation_type);
+  MaybeGetStackTrace(req_->pid, Result::VIOLATION);
+  SetExitStatusCode(Result::VIOLATION, syscall.nr());
+  notify_->EventSyscallViolation(syscall, violation_type);
+  result_.SetSyscall(std::make_unique<Syscall>(syscall));
+  KillSandboxee();
+}
+
+void UnotifyMonitor::AllowSyscallViaUnotify() {
+  memset(resp_.get(), 0, resp_size_);
+  resp_->id = req_->id;
+  resp_->val = 0;
+  resp_->error = 0;
+  resp_->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+  if (ioctl(seccomp_notify_fd_.get(), SECCOMP_IOCTL_NOTIF_SEND, resp_.get()) !=
+      0) {
+    if (errno == ENOENT) {
+      VLOG(1) << "Unotify send failed with ENOENT";
+    } else {
+      LOG_IF(ERROR, errno == EINVAL)
+          << "Unotify send failed with EINVAL. Likely "
+             "SECCOMP_USER_NOTIF_FLAG_CONTINUE unsupported by the kernel.";
+      SetExitStatusCode(Result::INTERNAL_ERROR, Result::FAILED_NOTIFY);
+    }
+  }
 }
 
 void UnotifyMonitor::HandleUnotify() {
@@ -185,16 +243,31 @@ void UnotifyMonitor::HandleUnotify() {
                   {req_->data.args[0], req_->data.args[1], req_->data.args[2],
                    req_->data.args[3], req_->data.args[4], req_->data.args[5]},
                   req_->pid, 0, req_->data.instruction_pointer);
-  ViolationType violation_type = syscall.arch() == Syscall::GetHostArch()
-                                     ? kSyscallViolation
-                                     : kArchitectureSwitchViolation;
-  LogSyscallViolation(syscall);
-  notify_->EventSyscallViolation(syscall, violation_type);
-  MaybeGetStackTrace(req_->pid, Result::VIOLATION);
-  SetExitStatusCode(Result::VIOLATION, syscall.nr());
-  notify_->EventSyscallViolation(syscall, violation_type);
-  result_.SetSyscall(std::make_unique<Syscall>(syscall));
-  KillSandboxee();
+  absl::StatusOr<uint32_t> policy_ret =
+      bpf::Evaluate(original_policy_, req_->data);
+  if (!policy_ret.ok()) {
+    LOG(ERROR) << "Failed to evaluate policy: " << policy_ret.status();
+    SetExitStatusCode(Result::INTERNAL_ERROR, Result::FAILED_NOTIFY);
+  }
+  const sock_filter trace_action = SANDBOX2_TRACE;
+  bool should_trace = *policy_ret == trace_action.k;
+  Notify::TraceAction trace_response = Notify::TraceAction::kDeny;
+  if (should_trace) {
+    trace_response = notify_->EventSyscallTrace(syscall);
+  }
+  switch (trace_response) {
+    case Notify::TraceAction::kAllow:
+      AllowSyscallViaUnotify();
+      return;
+    case Notify::TraceAction::kDeny:
+      HandleViolation(syscall);
+      return;
+    case Notify::TraceAction::kInspectAfterReturn:
+      LOG(FATAL) << "TraceAction::kInspectAfterReturn not supported by unotify "
+                    "monitor";
+    default:
+      LOG(FATAL) << "Unknown TraceAction: " << static_cast<int>(trace_response);
+  }
 }
 
 void UnotifyMonitor::Run() {
@@ -223,7 +296,7 @@ void UnotifyMonitor::Run() {
   while (result_.final_status() == Result::UNSET) {
     int64_t deadline = deadline_millis_.load(std::memory_order_relaxed);
     absl::Duration remaining = absl::FromUnixMillis(deadline) - absl::Now();
-    if (deadline != 0 && remaining < absl::ZeroDuration()) {
+    if (deadline != 0 && remaining <= absl::ZeroDuration()) {
       VLOG(1) << "Sandbox process hit timeout due to the walltime timer";
       timed_out_ = true;
       MaybeGetStackTrace(process_.main_pid, Result::TIMEOUT);
@@ -267,7 +340,7 @@ void UnotifyMonitor::Run() {
     }
     if (pfds[2].revents & POLLIN) {
       uint64_t value = 0;
-      read(monitor_notify_fd_.get(), &value, sizeof(value));
+      (void)read(monitor_notify_fd_.get(), &value, sizeof(value));
       continue;
     }
     if (pfds[0].revents & POLLIN) {
@@ -340,6 +413,8 @@ bool UnotifyMonitor::InitSetupUnotify() {
   }
   req_size_ = sizes.seccomp_notif;
   req_.reset(static_cast<seccomp_notif*>(malloc(req_size_)));
+  resp_size_ = sizes.seccomp_notif_resp;
+  resp_.reset(static_cast<seccomp_notif_resp*>(malloc(resp_size_)));
   return true;
 }
 
@@ -359,7 +434,8 @@ void UnotifyMonitor::NotifyMonitor() {
     return;
   }
   uint64_t value = 1;
-  write(monitor_notify_fd_.get(), &value, sizeof(value));
+  PCHECK(write(monitor_notify_fd_.get(), &value, sizeof(value)) ==
+         sizeof(value));
 }
 
 bool UnotifyMonitor::KillSandboxee() {
@@ -380,12 +456,11 @@ void UnotifyMonitor::KillInit() {
 
 void UnotifyMonitor::Join() {
   absl::MutexLock lock(&notify_mutex_);
-  if (thread_) {
-    thread_->join();
+  if (thread_.IsJoinable()) {
+    thread_.Join();
     CHECK(IsDone()) << "Monitor did not terminate";
     VLOG(1) << "Final execution status: " << result_.ToString();
     CHECK(result_.final_status() != Result::UNSET);
-    thread_.reset();
     monitor_notify_fd_.Close();
   }
 }

@@ -24,6 +24,8 @@ add_library(sapi_generator
   diagnostics.h
   emitter.h
   emitter.cc
+  emitter_base.h
+  emitter_base.cc
   generator.h
   generator.cc
   types.h
@@ -121,7 +123,10 @@ add_executable(sapi_generator_tool
   generator_tool.cc
 )
 target_link_libraries(sapi_generator_tool PRIVATE
-  absl::statusor
+  absl::base
+  absl::no_destructor
+  absl::status
+  absl::strings
   sapi::base
   sapi::file_base
   sapi::file_helpers
