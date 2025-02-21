@@ -14,6 +14,7 @@
 
 #include "sandboxed_api/sandbox2/network_proxy/client.h"
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <syscall.h>
 #include <unistd.h>
@@ -25,14 +26,16 @@
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "sandboxed_api/sandbox2/util/syscall_trap.h"
+#include "sandboxed_api/util/fileops.h"
 #include "sandboxed_api/util/status_macros.h"
 
 namespace sandbox2 {
+using ::sapi::file_util::fileops::FDCloser;
 
 absl::Status NetworkProxyClient::Connect(int sockfd,
                                          const struct sockaddr* addr,
                                          socklen_t addrlen) {
-  absl::MutexLock lock(&mutex_);
+  int oldflags = fcntl(sockfd, F_GETFL, 0);
 
   // Check if socket is SOCK_STREAM
   int type;
@@ -46,29 +49,25 @@ absl::Status NetworkProxyClient::Connect(int sockfd,
     return absl::InvalidArgumentError(
         "Invalid socket, only SOCK_STREAM is allowed");
   }
+  SAPI_ASSIGN_OR_RETURN(FDCloser s, ConnectInternal(addr, addrlen));
+  if (fcntl(s.get(), F_SETFL, oldflags) != 0) {
+    return absl::InternalError("Failed to restore socket flags");
+  }
+  if (dup2(s.get(), sockfd) == -1) {
+    return absl::InternalError("Duplicating socket failed");
+  }
+  return absl::OkStatus();
+}
 
+absl::StatusOr<FDCloser> NetworkProxyClient::ConnectInternal(
+    const struct sockaddr* addr, socklen_t addrlen) {
+  absl::MutexLock lock(&mutex_);
   // Send sockaddr struct
   if (!comms_.SendBytes(reinterpret_cast<const uint8_t*>(addr), addrlen)) {
     errno = EIO;
     return absl::InternalError("Sending data to network proxy failed");
   }
 
-  SAPI_RETURN_IF_ERROR(ReceiveRemoteResult());
-
-  // Receive new socket
-  int s;
-  if (!comms_.RecvFD(&s)) {
-    errno = EIO;
-    return absl::InternalError("Receiving data from network proxy failed");
-  }
-  if (dup2(s, sockfd) == -1) {
-    close(s);
-    return absl::InternalError("Processing data from network proxy failed");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status NetworkProxyClient::ReceiveRemoteResult() {
   int result;
   if (!comms_.RecvInt32(&result)) {
     errno = EIO;
@@ -78,7 +77,13 @@ absl::Status NetworkProxyClient::ReceiveRemoteResult() {
     errno = result;
     return absl::ErrnoToStatus(errno, "Error in network proxy server");
   }
-  return absl::OkStatus();
+
+  int sock;
+  if (!comms_.RecvFD(&sock)) {
+    errno = EIO;
+    return absl::InternalError("Receiving fd from network proxy failed");
+  }
+  return FDCloser(sock);
 }
 
 NetworkProxyClient* NetworkProxyHandler::network_proxy_client_ = nullptr;

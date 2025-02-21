@@ -19,7 +19,7 @@
 
 #include "absl/strings/string_view.h"
 #include "sandboxed_api/config.h"
-#include "sandboxed_api/sandbox2/allow_all_syscalls.h"
+#include "sandboxed_api/sandbox2/allowlists/all_syscalls.h"
 #include "sandboxed_api/sandbox2/policybuilder.h"
 #include "sandboxed_api/util/path.h"
 
@@ -30,12 +30,9 @@ sandbox2::PolicyBuilder CreateDefaultPermissiveTestPolicy(
   sandbox2::PolicyBuilder builder;
   // Don't restrict the syscalls at all.
   builder.DefaultAction(sandbox2::AllowAllSyscalls());
-  if (sapi::host_os::IsAndroid()) {
-    builder.DisableNamespaces();
-    return builder;
-  }
   if (IsCoverageRun()) {
-    builder.AddDirectory(getenv("COVERAGE_DIR"), /*is_ro=*/false);
+    builder.AddDirectory(absl::NullSafeStringView(getenv("COVERAGE_DIR")),
+                         /*is_ro=*/false);
   }
   if constexpr (sapi::sanitizers::IsAny()) {
     builder.AddLibrariesForBinary(bin_path);

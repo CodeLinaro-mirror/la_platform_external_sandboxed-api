@@ -29,7 +29,6 @@
 #include "sandboxed_api/sandbox2/namespace.h"
 #include "sandboxed_api/sandbox2/network_proxy/filtering.h"
 #include "sandboxed_api/sandbox2/syscall.h"  // IWYU pragma: export
-#include "sandboxed_api/sandbox2/violation.pb.h"
 
 #define SANDBOX2_TRACE         \
   BPF_STMT(BPF_RET + BPF_K,    \
@@ -44,7 +43,6 @@ namespace internal {
 inline constexpr uintptr_t kExecveMagic = 0x921c2c34;
 }  // namespace internal
 
-class Comms;
 class MonitorBase;
 class PolicyBuilder;
 
@@ -55,13 +53,6 @@ class Policy final {
 
   Policy(Policy&&) = delete;
   Policy& operator=(Policy&&) = delete;
-
-  // Stores information about the policy (and the policy builder if existing)
-  // in the protobuf structure.
-  void GetPolicyDescription(PolicyDescription* policy) const;
-
-  // Sends the policy over the IPC channel.
-  bool SendPolicy(Comms* comms, bool user_notif) const;
 
   // Returns the policy, but modifies it according to FLAGS and internal
   // requirements (message passing via Comms, Executor::WaitForExecve etc.).
@@ -104,8 +95,8 @@ class Policy final {
   bool collect_stacktrace_on_kill_ = true;
   bool collect_stacktrace_on_exit_ = false;
 
-  // Optional pointer to a PolicyBuilder description pb object.
-  std::optional<PolicyBuilderDescription> policy_builder_description_;
+  bool allow_map_exec_ = false;
+  bool allow_speculation_ = false;
 
   // The policy set by the user.
   std::vector<sock_filter> user_policy_;

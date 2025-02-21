@@ -52,7 +52,8 @@ void ExitNormally(int x = 0) {
   IndirectLibcCall([x]() {
     // _exit is marked noreturn, which makes stack traces a bit trickier -
     // work around by using a volatile read
-    if (volatile int y = 1) {
+    volatile int y = 1;
+    if (y) {
       _exit(x);
     }
   });
@@ -80,6 +81,19 @@ void RunTest(int testno) {
     case 4:
       SleepForXSeconds(10);
       break;
+    case 5: {
+      constexpr int kMaxForks = 16;
+      for (int i = 0; i < kMaxForks; ++i) {
+        if (fork() == 0) {
+          if (i == kMaxForks - 1) {
+            ViolatePolicy();
+          }
+          break;
+        }
+      }
+      SleepForXSeconds(10);
+      break;
+    }
     default:
       SAPI_RAW_LOG(FATAL, "Unknown test case: %d", testno);
   }

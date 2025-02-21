@@ -12,24 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Workspace definition used when Bzlmod is disabled
 workspace(name = "com_google_sandboxed_api")
 
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("//sandboxed_api/bazel:sapi_deps.bzl", "sapi_deps")
 
 # Load Sandboxed API dependencies
 sapi_deps()
 
 load("@bazel_skylib//lib:versions.bzl", "versions")
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+versions.check(minimum_bazel_version = "5.1.0")
+
+load("@rules_python//python:repositories.bzl", "py_repositories")
+
+py_repositories()
+
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+pip_parse(
+    name = "pypi",
+    requirements_lock = "//sandboxed_api/tools/python_generator:requirements_lock.txt",
+)
+
+load("@pypi//:requirements.bzl", "install_deps")
+
+# Initialize repositories for all packages in requirements_lock.txt.
+install_deps()
+
+load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
+
+protobuf_deps()
+
 load(
     "//sandboxed_api/bazel:llvm_config.bzl",
     "llvm_disable_optional_support_deps",
 )
-load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
-
-versions.check(minimum_bazel_version = "5.1.0")
-
-protobuf_deps()
 
 llvm_disable_optional_support_deps()
 

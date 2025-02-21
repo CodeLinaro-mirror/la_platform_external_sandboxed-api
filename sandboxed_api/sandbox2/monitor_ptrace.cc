@@ -27,7 +27,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <ctime>
-#include <deque>
 #include <fstream>
 #include <ios>
 #include <memory>
@@ -44,6 +43,7 @@
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -64,12 +64,20 @@
 #include "sandboxed_api/sandbox2/sanitizer.h"
 #include "sandboxed_api/sandbox2/syscall.h"
 #include "sandboxed_api/sandbox2/util.h"
-#include "sandboxed_api/util/raw_logging.h"
+#include "sandboxed_api/sandbox2/util/pid_waiter.h"
 #include "sandboxed_api/util/status_macros.h"
+#include "sandboxed_api/util/thread.h"
 
 ABSL_FLAG(bool, sandbox2_log_all_stack_traces, false,
           "If set, sandbox2 monitor will log stack traces of all monitored "
           "threads/processes that are reported to terminate with a signal.");
+
+ABSL_FLAG(bool, sandbox2_monitor_ptrace_use_deadline_manager, false,
+          "If set, ptrace monitor will use deadline manager to enforce "
+          "deadlines and as notification mechanism");
+
+ABSL_FLAG(bool, sandbox2_log_unobtainable_stack_traces_errors, true,
+          "If set, unobtainable stack trace will be logged as errors.");
 
 ABSL_FLAG(absl::Duration, sandbox2_stack_traces_collection_timeout,
           absl::Seconds(1),
@@ -81,77 +89,6 @@ ABSL_DECLARE_FLAG(bool, sandbox2_danger_danger_permit_all);
 
 namespace sandbox2 {
 namespace {
-
-// Since waitpid() is biased towards newer threads, we run the risk of starving
-// older threads if the newer ones raise a lot of events.
-// To avoid it, we use this class to gather all the waiting threads and then
-// return them one at a time on each call to Wait().
-// In this way, everyone gets their chance.
-class PidWaiter {
- public:
-  // Constructs a PidWaiter where the given priority_pid is checked first.
-  explicit PidWaiter(pid_t priority_pid) : priority_pid_(priority_pid) {}
-
-  // Returns the PID of a thread that needs attention, populating 'status' with
-  // the status returned by the waitpid() call. It returns 0 if no threads
-  // require attention at the moment, or -1 if there was an error, in which case
-  // the error value can be found in 'errno'.
-  int Wait(int* status) {
-    RefillStatuses();
-
-    if (statuses_.empty()) {
-      if (last_errno_ == 0) return 0;
-      errno = last_errno_;
-      last_errno_ = 0;
-      return -1;
-    }
-
-    const auto& entry = statuses_.front();
-    pid_t pid = entry.first;
-    *status = entry.second;
-    statuses_.pop_front();
-    return pid;
-  }
-
- private:
-  bool CheckStatus(pid_t pid) {
-    int status;
-    // It should be a non-blocking operation (hence WNOHANG), so this function
-    // returns quickly if there are no events to be processed.
-    pid_t ret =
-        waitpid(pid, &status, __WNOTHREAD | __WALL | WUNTRACED | WNOHANG);
-    if (ret < 0) {
-      last_errno_ = errno;
-      return true;
-    }
-    if (ret == 0) {
-      return false;
-    }
-    statuses_.emplace_back(ret, status);
-    return true;
-  }
-
-  void RefillStatuses() {
-    constexpr int kMaxIterations = 1000;
-    constexpr int kPriorityCheckPeriod = 100;
-    if (!statuses_.empty()) {
-      return;
-    }
-    for (int i = 0; last_errno_ == 0 && i < kMaxIterations; ++i) {
-      bool should_check_priority = (i % kPriorityCheckPeriod) == 0;
-      if (should_check_priority && CheckStatus(priority_pid_)) {
-        return;
-      }
-      if (!CheckStatus(-1)) {
-        break;
-      }
-    }
-  }
-
-  pid_t priority_pid_;
-  std::deque<std::pair<pid_t, int>> statuses_ = {};
-  int last_errno_ = 0;
-};
 
 // We could use the ProcMapsIterator, however we want the full file content.
 std::string ReadProcMaps(pid_t pid) {
@@ -210,6 +147,8 @@ PtraceMonitor::PtraceMonitor(Executor* executor, Policy* policy, Notify* notify)
   }
   external_kill_request_flag_.test_and_set(std::memory_order_relaxed);
   dump_stack_request_flag_.test_and_set(std::memory_order_relaxed);
+  use_deadline_manager_ =
+      absl::GetFlag(FLAGS_sandbox2_monitor_ptrace_use_deadline_manager);
 }
 
 bool PtraceMonitor::IsActivelyMonitoring() {
@@ -232,7 +171,9 @@ void PtraceMonitor::SetAdditionalResultInfo(std::unique_ptr<Regs> regs) {
   absl::StatusOr<std::vector<std::string>> stack_trace =
       GetAndLogStackTrace(result_.GetRegs());
   if (!stack_trace.ok()) {
-    LOG(ERROR) << "Could not obtain stack trace: " << stack_trace.status();
+    LOG_IF(ERROR,
+           absl::GetFlag(FLAGS_sandbox2_log_unobtainable_stack_traces_errors))
+        << "Could not obtain stack trace: " << stack_trace.status();
     return;
   }
   result_.set_stack_trace(*stack_trace);
@@ -265,25 +206,31 @@ bool PtraceMonitor::InterruptSandboxee() {
 #define __WPTRACEEVENT(x) ((x & 0xff0000) >> 16)
 
 void PtraceMonitor::NotifyMonitor() {
-  absl::ReaderMutexLock lock(&notify_mutex_);
-  if (thread_ != nullptr) {
-    pthread_kill(thread_->native_handle(), SIGCHLD);
+  if (use_deadline_manager_) {
+    pid_waiter_.Notify();
+  } else {
+    absl::MutexLock lock(&thread_mutex_);
+    if (thread_.IsJoinable()) {
+      pthread_kill(thread_.handle(), SIGCHLD);
+    }
   }
 }
 
 void PtraceMonitor::Join() {
-  absl::MutexLock lock(&notify_mutex_);
-  if (thread_) {
-    thread_->join();
+  absl::MutexLock lock(&thread_mutex_);
+  if (thread_.IsJoinable()) {
+    thread_.Join();
     CHECK(IsDone()) << "Monitor did not terminate";
     VLOG(1) << "Final execution status: " << result_.ToString();
     CHECK(result_.final_status() != Result::UNSET);
-    thread_.reset();
   }
 }
 
 void PtraceMonitor::RunInternal() {
-  thread_ = std::make_unique<std::thread>(&PtraceMonitor::Run, this);
+  {
+    absl::MutexLock lock(&thread_mutex_);
+    thread_ = sapi::Thread(this, &PtraceMonitor::Run, "sandbox2-Monitor");
+  }
 
   // Wait for the Monitor to set-up the sandboxee correctly (or fail while
   // doing that). From here on, it is safe to use the IPC object for
@@ -300,7 +247,7 @@ void PtraceMonitor::Run() {
   absl::Cleanup setup_notify = [this] { setup_notification_.Notify(); };
   // It'd be costly to initialize the sigset_t for each sigtimedwait()
   // invocation, so do it once per Monitor.
-  if (!InitSetupSignals()) {
+  if (!use_deadline_manager_ && !InitSetupSignals()) {
     SetExitStatusCode(Result::SETUP_ERROR, Result::FAILED_SIGNALS);
     return;
   }
@@ -317,7 +264,7 @@ void PtraceMonitor::Run() {
   std::move(setup_notify).Invoke();
 
   bool sandboxee_exited = false;
-  PidWaiter pid_waiter(process_.main_pid);
+  pid_waiter_.SetPriorityPid(process_.main_pid);
   int status;
   // All possible still running children of main process, will be killed due to
   // PTRACE_O_EXITKILL ptrace() flag.
@@ -361,13 +308,21 @@ void PtraceMonitor::Run() {
         break;
       }
     }
-
-    pid_t ret = pid_waiter.Wait(&status);
+    if (use_deadline_manager_) {
+      absl::Time effective_deadline = hard_deadline_;
+      if (deadline != 0 && hard_deadline_ == absl::InfiniteFuture()) {
+        effective_deadline = absl::FromUnixMillis(deadline);
+      }
+      pid_waiter_.SetDeadline(effective_deadline);
+    }
+    pid_t ret = pid_waiter_.Wait(&status);
     if (ret == 0) {
-      constexpr timespec ts = {kWakeUpPeriodSec, kWakeUpPeriodNSec};
-      int signo = sigtimedwait(&sset_, nullptr, &ts);
-      LOG_IF(ERROR, signo != -1 && signo != SIGCHLD)
-          << "Unknown signal received: " << signo;
+      if (!use_deadline_manager_) {
+        constexpr timespec ts = {kWakeUpPeriodSec, kWakeUpPeriodNSec};
+        int signo = sigtimedwait(&sset_, nullptr, &ts);
+        LOG_IF(ERROR, signo != -1 && signo != SIGCHLD)
+            << "Unknown signal received: " << signo;
+      }
       continue;
     }
 
@@ -376,7 +331,7 @@ void PtraceMonitor::Run() {
         LOG(ERROR) << "PANIC(). The main process has not exited yet, "
                    << "yet we haven't seen its exit event";
         SetExitStatusCode(Result::INTERNAL_ERROR, Result::FAILED_CHILD);
-      } else {
+      } else if (!use_deadline_manager_ || errno != EINTR) {
         PLOG(ERROR) << "waitpid() failed";
       }
       continue;
@@ -447,8 +402,14 @@ void PtraceMonitor::Run() {
             << result_.ToString();
         break;
       }
-      pid_t ret = pid_waiter.Wait(&status);
+      if (use_deadline_manager_) {
+        pid_waiter_.SetDeadline(deadline);
+      }
+      pid_t ret = pid_waiter_.Wait(&status);
       if (ret == -1) {
+        if (use_deadline_manager_ && errno == EINTR) {
+          continue;
+        }
         if (!log_stack_traces || ret != ECHILD) {
           PLOG(ERROR) << "waitpid() failed";
         }
@@ -463,8 +424,10 @@ void PtraceMonitor::Run() {
       }
 
       if (ret == 0) {
-        auto ts = absl::ToTimespec(left);
-        sigtimedwait(&sset_, nullptr, &ts);
+        if (!use_deadline_manager_) {
+          auto ts = absl::ToTimespec(left);
+          sigtimedwait(&sset_, nullptr, &ts);
+        }
         continue;
       }
 
@@ -520,6 +483,69 @@ bool PtraceMonitor::InitSetupSignals() {
   return true;
 }
 
+absl::Status TryAttach(const absl::flat_hash_set<int>& tasks,
+                       absl::Time deadline,
+                       absl::flat_hash_set<int>& tasks_attached) {
+  constexpr intptr_t kPtraceOptions =
+      PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+      PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC |
+      PTRACE_O_TRACEEXIT | PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL;
+  auto format_ptrace_error = [](int task, absl::string_view message) {
+    return absl::StrCat("ptrace(PTRACE_SEIZE, ", task, ", 0, ", "0x",
+                        absl::Hex(kPtraceOptions), "): ", message);
+  };
+
+  absl::flat_hash_set<int> cur_tasks = tasks;
+  int retries = 0;
+
+  // In some situations we allow ptrace to try again when it fails.
+  while (!cur_tasks.empty()) {
+    absl::flat_hash_set<int> retry_tasks;
+    for (int task : cur_tasks) {
+      if (tasks_attached.contains(task)) {
+        continue;
+      }
+      int ret = ptrace(PTRACE_SEIZE, task, 0, kPtraceOptions);
+      if (ret != 0) {
+        if (errno == EPERM) {
+          // Sometimes when a task is exiting we can get an EPERM from ptrace.
+          // Let's try again up until the timeout in this situation.
+          PLOG(WARNING) << format_ptrace_error(task, "Retrying after EPERM");
+          retry_tasks.insert(task);
+          continue;
+        }
+        if (errno == ESRCH) {
+          // A task may have exited since we captured the task list, we will
+          // allow things to continue after we log a warning.
+          PLOG(WARNING) << format_ptrace_error(
+              task, "Skipping exited task. Continuing with other tasks.");
+          continue;
+        }
+        // Any other errno will be considered a failure.
+        return absl::ErrnoToStatus(errno, format_ptrace_error(task, "Failure"));
+      }
+      tasks_attached.insert(task);
+    }
+    if (!retry_tasks.empty()) {
+      if (absl::Now() >= deadline) {
+        return absl::DeadlineExceededError(absl::StrCat(
+            "Attaching to sandboxee timed out: could not attach to ",
+            cur_tasks.size(), " tasks"));
+      }
+      // Exponential Backoff.
+      constexpr absl::Duration kInitialRetry = absl::Milliseconds(1);
+      constexpr absl::Duration kMaxRetry = absl::Milliseconds(20);
+      const absl::Duration retry_interval =
+          kInitialRetry * (1 << std::min(10, retries++));
+      absl::SleepFor(
+          std::min({retry_interval, kMaxRetry, deadline - absl::Now()}));
+    }
+    cur_tasks = std::move(retry_tasks);
+  }
+
+  return absl::OkStatus();
+}
+
 bool PtraceMonitor::InitPtraceAttach() {
   if (process_.init_pid > 0) {
     if (ptrace(PTRACE_SEIZE, process_.init_pid, 0, PTRACE_O_EXITKILL) != 0) {
@@ -531,102 +557,57 @@ bool PtraceMonitor::InitPtraceAttach() {
   }
 
   // Get a list of tasks.
-  absl::flat_hash_set<int> tasks;
-  if (auto task_list = sanitizer::GetListOfTasks(process_.main_pid);
-      task_list.ok()) {
-    tasks = *std::move(task_list);
-  } else {
-    LOG(ERROR) << "Could not get list of tasks: "
-               << task_list.status().message();
+  absl::StatusOr<absl::flat_hash_set<int>> tasks =
+      sanitizer::GetListOfTasks(process_.main_pid);
+  if (!tasks.ok()) {
+    LOG(ERROR) << "Could not get list of tasks: " << tasks.status().message();
     return false;
   }
 
-  if (tasks.find(process_.main_pid) == tasks.end()) {
+  if (!tasks->contains(process_.main_pid)) {
     LOG(ERROR) << "The pid " << process_.main_pid
                << " was not found in its own tasklist.";
     return false;
   }
 
   // With TSYNC, we can allow threads: seccomp applies to all threads.
-  if (tasks.size() > 1) {
-    LOG(WARNING) << "PID " << process_.main_pid << " has " << tasks.size()
-                 << " threads,"
-                 << " at the time of call to SandboxMeHere. If you are seeing"
-                 << " more sandbox violations than expected, this might be"
-                 << " the reason why"
+  if (tasks->size() > 1) {
+    LOG(WARNING) << "PID " << process_.main_pid << " has " << tasks->size()
+                 << " threads, at the time of call to SandboxMeHere(). If you "
+                    "are seeing more sandbox violations than expected, this "
+                    "might be the reason why"
                  << ".";
   }
 
   absl::flat_hash_set<int> tasks_attached;
-  int retries = 0;
-  absl::Time deadline = absl::Now() + absl::Seconds(2);
+  absl::Time deadline = absl::Now() + absl::Seconds(4);
 
-  // In some situations we allow ptrace to try again when it fails.
-  while (!tasks.empty()) {
-    absl::flat_hash_set<int> tasks_left;
-    for (int task : tasks) {
-      constexpr intptr_t options =
-          PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-          PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC |
-          PTRACE_O_TRACEEXIT | PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL;
-      int ret = ptrace(PTRACE_SEIZE, task, 0, options);
-      if (ret != 0) {
-        if (errno == EPERM) {
-          // Sometimes when a task is exiting we can get an EPERM from ptrace.
-          // Let's try again up until the timeout in this situation.
-          PLOG(WARNING) << "ptrace(PTRACE_SEIZE, " << task << ", "
-                        << absl::StrCat("0x", absl::Hex(options))
-                        << "), trying again...";
-          tasks_left.insert(task);
-          continue;
-        }
-        if (errno == ESRCH) {
-          // A task may have exited since we captured the task list, we will
-          // allow things to continue after we log a warning.
-          PLOG(WARNING)
-              << "ptrace(PTRACE_SEIZE, " << task << ", "
-              << absl::StrCat("0x", absl::Hex(options))
-              << ") skipping exited task. Continuing with other tasks.";
-          continue;
-        }
-        // Any other errno will be considered a failure.
-        PLOG(ERROR) << "ptrace(PTRACE_SEIZE, " << task << ", "
-                    << absl::StrCat("0x", absl::Hex(options)) << ") failed.";
-        return false;
-      }
-      tasks_attached.insert(task);
+  constexpr int kMaxRetries = 3;
+  for (int retries = 0; retries < kMaxRetries && *tasks != tasks_attached;
+       ++retries) {
+    if (retries > 0) {
+      LOG(ERROR) << "PID " << process_.main_pid
+                 << " spawned new threads while we were trying to attach to it "
+                    "(attempt "
+                 << retries << "/" << kMaxRetries << ")";
     }
-    if (!tasks_left.empty()) {
-      if (absl::Now() < deadline) {
-        LOG(ERROR) << "Attaching to sandboxee timed out: could not attach to "
-                   << tasks_left.size() << " tasks";
-        return false;
-      }
-      // Exponential Backoff.
-      constexpr absl::Duration kInitialRetry = absl::Milliseconds(1);
-      constexpr absl::Duration kMaxRetry = absl::Milliseconds(20);
-      const absl::Duration retry_interval =
-          kInitialRetry * (1 << std::min(10, retries++));
-      absl::SleepFor(
-          std::min({retry_interval, kMaxRetry, deadline - absl::Now()}));
+    if (absl::Status status = TryAttach(*tasks, deadline, tasks_attached);
+        !status.ok()) {
+      LOG(ERROR) << status.message();
+      return false;
     }
-    tasks = std::move(tasks_left);
-  }
 
-  // Get a list of tasks after attaching.
-  if (auto tasks_list = sanitizer::GetListOfTasks(process_.main_pid);
-      tasks_list.ok()) {
-    tasks = *std::move(tasks_list);
-  } else {
-    LOG(ERROR) << "Could not get list of tasks: "
-               << tasks_list.status().message();
-    return false;
+    // Get a list of tasks after attaching.
+    tasks = sanitizer::GetListOfTasks(process_.main_pid);
+    if (!tasks.ok()) {
+      LOG(ERROR) << "Could not get list of tasks: " << tasks.status().message();
+      return false;
+    }
   }
-
-  // Check that we attached to all the threads
-  if (tasks_attached != tasks) {
-    LOG(ERROR) << "The pid " << process_.main_pid
-               << " spawned new threads while we were trying to attach to it.";
+  if (*tasks != tasks_attached) {
+    LOG(ERROR) << "PID " << process_.main_pid
+               << " spawned new threads while we were trying to attach to it "
+                  "(retries exhausted)";
     return false;
   }
 
@@ -652,9 +633,8 @@ bool PtraceMonitor::InitPtraceAttach() {
 void PtraceMonitor::ActionProcessSyscall(Regs* regs, const Syscall& syscall) {
   // If the sandboxing is not enabled yet, allow the first __NR_execveat.
   if (syscall.nr() == __NR_execveat && !IsActivelyMonitoring()) {
-    VLOG(1) << "[PERMITTED/BEFORE_EXECVEAT]: "
-            << "SYSCALL ::: PID: " << regs->pid() << ", PROG: '"
-            << util::GetProgName(regs->pid())
+    VLOG(1) << "[PERMITTED/BEFORE_EXECVEAT]: " << "SYSCALL ::: PID: "
+            << regs->pid() << ", PROG: '" << util::GetProgName(regs->pid())
             << "' : " << syscall.GetDescription();
     ContinueProcess(regs->pid(), 0);
     return;
@@ -688,7 +668,7 @@ void PtraceMonitor::ActionProcessSyscall(Regs* regs, const Syscall& syscall) {
     return;
   }
 
-  ActionProcessSyscallViolation(regs, syscall, kSyscallViolation);
+  ActionProcessSyscallViolation(regs, syscall, ViolationType::kSyscall);
 }
 
 void PtraceMonitor::ActionProcessSyscallViolation(
@@ -739,7 +719,8 @@ void PtraceMonitor::EventPtraceSeccomp(pid_t pid, int event_msg) {
   // If the architecture of the syscall used is different that the current host
   // architecture, report a violation.
   if (syscall_arch != Syscall::GetHostArch()) {
-    ActionProcessSyscallViolation(&regs, syscall, kArchitectureSwitchViolation);
+    ActionProcessSyscallViolation(&regs, syscall,
+                                  ViolationType::kArchitectureSwitch);
     return;
   }
 
@@ -856,8 +837,9 @@ void PtraceMonitor::EventPtraceExit(pid_t pid, int event_msg) {
   // Process signaled due to seccomp violation.
   if (is_seccomp) {
     VLOG(1) << "PID: " << pid << " violation uncovered via the EXIT_EVENT";
-    ActionProcessSyscallViolation(
-        regs.get(), regs->ToSyscall(Syscall::GetHostArch()), kSyscallViolation);
+    ActionProcessSyscallViolation(regs.get(),
+                                  regs->ToSyscall(Syscall::GetHostArch()),
+                                  ViolationType::kSyscall);
     return;
   }
 
@@ -949,7 +931,7 @@ void PtraceMonitor::StateProcessStopped(pid_t pid, int status) {
 
     if (!stack_trace.ok()) {
       LOG(WARNING) << "FAILED TO GET SANDBOX STACK : " << stack_trace.status();
-    } else if (SAPI_VLOG_IS_ON(0)) {
+    } else if (VLOG_IS_ON(0)) {
       VLOG(0) << "SANDBOX STACK: PID: " << pid << ", [";
       for (const auto& frame : *stack_trace) {
         VLOG(0) << "  " << frame;
@@ -958,10 +940,6 @@ void PtraceMonitor::StateProcessStopped(pid_t pid, int status) {
     }
     should_dump_stack_ = false;
   }
-
-#ifndef PTRACE_EVENT_STOP
-#define PTRACE_EVENT_STOP 128
-#endif
 
   if (is_syscall_exit) {
     VLOG(2) << "PID: " << pid << " syscall-exit-stop: " << event_msg;

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "sandboxed_api/sandbox2/namespace.h"
+#include "sandboxed_api/sandbox2/namespace.h"  // IWYU pragma: keep
 
+#include <asm-generic/unistd.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -27,10 +28,13 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "sandboxed_api/sandbox2/allow_all_syscalls.h"
+#include "sandboxed_api/sandbox2/allowlists/all_syscalls.h"
+#include "sandboxed_api/sandbox2/allowlists/namespaces.h"
+#include "sandboxed_api/sandbox2/allowlists/unrestricted_networking.h"
 #include "sandboxed_api/sandbox2/executor.h"
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/policybuilder.h"
@@ -61,7 +65,7 @@ using ::testing::Matcher;
 using ::testing::Ne;
 using ::testing::SizeIs;
 using ::testing::StartsWith;
-using ::testing::StrEq;  // sapi::google3-only(broken matchers)
+using ::testing::StrEq;
 
 std::string GetTestcaseBinPath(absl::string_view bin_name) {
   return GetTestSourcePath(absl::StrCat("sandbox2/testcases/", bin_name));
@@ -151,7 +155,7 @@ TEST(NamespaceTest, UserNamespaceWorks) {
     std::vector<std::string> result = RunSandboxeeWithArgsAndPolicy(
         path, {path, "2"},
         PolicyBuilder()
-            .DisableNamespaces()
+            .DisableNamespaces(NamespacesToken())
             .DefaultAction(AllowAllSyscalls())  // Do not restrict syscalls
             .BuildOrDie());
     EXPECT_THAT(result, ElementsAre(Ne("2")));
@@ -173,7 +177,7 @@ TEST(NamespaceTest, UserNamespaceIDMapWritten) {
     std::vector<std::string> result = RunSandboxeeWithArgsAndPolicy(
         path, {path, "3"},
         PolicyBuilder()
-            .DisableNamespaces()
+            .DisableNamespaces(NamespacesToken())
             .DefaultAction(AllowAllSyscalls())  // Do not restrict syscalls
             .BuildOrDie());
     EXPECT_THAT(result,
@@ -210,7 +214,7 @@ TEST(NamespaceTest, HostnameNone) {
   std::vector<std::string> result = RunSandboxeeWithArgsAndPolicy(
       path, {path, "7"},
       PolicyBuilder()
-          .DisableNamespaces()
+          .DisableNamespaces(NamespacesToken())
           .DefaultAction(AllowAllSyscalls())  // Do not restrict syscalls
           .BuildOrDie());
   EXPECT_THAT(result, ElementsAre(Ne("sandbox2")));
@@ -244,7 +248,7 @@ TEST(NamespaceTest, TestInterfacesNoNetwork) {
 TEST(NamespaceTest, TestInterfacesWithNetwork) {
   const std::string path = GetTestcaseBinPath("namespace");
   SAPI_ASSERT_OK_AND_ASSIGN(auto policy, CreateDefaultPermissiveTestPolicy(path)
-                                             .AllowUnrestrictedNetworking()
+                                             .Allow(UnrestrictedNetworking())
                                              .TryBuild());
 
   std::vector<std::string> result =
@@ -254,8 +258,61 @@ TEST(NamespaceTest, TestInterfacesWithNetwork) {
   EXPECT_THAT(result, SizeIs(Gt(1)));
 }
 
+TEST(NamespaceTest, TestNetNsModeForkServerShared) {
+  constexpr uint32_t kReadlink[] = {
+#ifdef __NR_readlink
+      __NR_readlink,
+#endif
+      __NR_readlinkat};
+
+  std::unique_ptr<sandbox2::Policy> policy;
+  const std::string path = GetTestcaseBinPath("namespace");
+  std::initializer_list<std::string> args = {path, "8"};
+
+  // Sandbox2 run without a ForkServer shared net_ns
+  SAPI_ASSERT_OK_AND_ASSIGN(policy, CreateDefaultPermissiveTestPolicy(path)
+                                        .AllowSyscalls(kReadlink)
+                                        .AddDirectory("/proc")
+                                        .TryBuild());
+  std::vector<std::string> result_individual_netns_run =
+      RunSandboxeeWithArgsAndPolicy(path, args, std::move(policy));
+  EXPECT_THAT(result_individual_netns_run, SizeIs(1));
+
+  // Two Sandbox2 runs with a ForkServer shared net_ns
+  SAPI_ASSERT_OK_AND_ASSIGN(policy, CreateDefaultPermissiveTestPolicy(path)
+                                        .AllowSyscalls(kReadlink)
+                                        .AddDirectory("/proc")
+                                        .UseForkServerSharedNetNs()
+                                        .TryBuild());
+  std::vector<std::string> result_one =
+      RunSandboxeeWithArgsAndPolicy(path, args, std::move(policy));
+  EXPECT_THAT(result_one.size(), Eq(1));
+
+  SAPI_ASSERT_OK_AND_ASSIGN(policy, CreateDefaultPermissiveTestPolicy(path)
+                                        .AllowSyscalls(kReadlink)
+                                        .AddDirectory("/proc")
+                                        .UseForkServerSharedNetNs()
+                                        .TryBuild());
+  std::vector<std::string> result_two =
+      RunSandboxeeWithArgsAndPolicy(path, args, std::move(policy));
+  EXPECT_THAT(result_two.size(), Eq(1));
+
+  EXPECT_THAT(result_one, Eq(result_two));
+  EXPECT_THAT(result_one, Ne(result_individual_netns_run));
+  EXPECT_THAT(result_two, Ne(result_individual_netns_run));
+}
+
+TEST(NamespaceTest, TestIncompatibleNetNsModes) {
+  const std::string path = GetTestcaseBinPath("namespace");
+  auto policy = CreateDefaultPermissiveTestPolicy(path)
+                    .Allow(UnrestrictedNetworking())
+                    .UseForkServerSharedNetNs()
+                    .TryBuild();
+  EXPECT_THAT(policy.status(),
+              sapi::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
 TEST(NamespaceTest, TestFiles) {
-  SKIP_ANDROID;
   const std::string path = GetTestcaseBinPath("namespace");
   std::vector<std::string> result =
       RunSandboxeeWithArgsAndPolicy(path, {path, "6", "/"});
