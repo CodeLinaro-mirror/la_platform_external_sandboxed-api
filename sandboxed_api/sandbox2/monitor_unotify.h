@@ -1,6 +1,8 @@
 #ifndef SANDBOXED_API_SANDBOX2_MONITOR_UNOTIFY_H_
 #define SANDBOXED_API_SANDBOX2_MONITOR_UNOTIFY_H_
 
+#include <linux/audit.h>
+#include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sys/sysinfo.h>
 #include <sys/types.h>
@@ -9,7 +11,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
-#include <thread>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,7 @@
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/util/fileops.h"
-#include "sandboxed_api/util/raw_logging.h"
+#include "sandboxed_api/util/thread.h"
 
 namespace sandbox2 {
 
@@ -35,6 +36,13 @@ struct seccomp_notif {
   __u32 pid;
   __u32 flags;
   struct seccomp_data data;
+};
+
+struct seccomp_notif_resp {
+  __u64 id;
+  __s64 val;
+  __s32 error;
+  __u32 flags;
 };
 #endif
 
@@ -66,19 +74,30 @@ class UnotifyMonitor : public MonitorBase {
     }
   }
 
+  void NotifyNetworkViolation() override { NotifyMonitor(); }
+
  private:
+  // Custom deleter for req_ and resp_ members which need to allocate space
+  // using malloc.
+  struct StdFreeDeleter {
+    void operator()(void* p) { std::free(p); }
+  };
+
   // Waits for events from monitored clients and signals from the main process.
   void RunInternal() override;
   void Join() override;
   void Run();
 
+  absl::Status SendPolicy(const std::vector<sock_filter>& policy) override;
   bool InitSetupUnotify();
   bool InitSetupNotifyEventFd();
   // Kills the main traced PID with SIGKILL.
-  // Returns false if an error occured and process could not be killed.
+  // Returns false if an error occurred and process could not be killed.
   bool KillSandboxee();
   void KillInit();
 
+  void AllowSyscallViaUnotify();
+  void HandleViolation(const Syscall& syscall);
   void HandleUnotify();
   void SetExitStatusFromStatusPipe();
 
@@ -91,6 +110,8 @@ class UnotifyMonitor : public MonitorBase {
   absl::Notification setup_notification_;
   sapi::file_util::fileops::FDCloser seccomp_notify_fd_;
   sapi::file_util::fileops::FDCloser monitor_notify_fd_;
+  // Original policy as configured by the user.
+  std::vector<sock_filter> original_policy_;
   // Deadline in Unix millis
   std::atomic<int64_t> deadline_millis_{0};
   // False iff external kill is requested
@@ -102,17 +123,19 @@ class UnotifyMonitor : public MonitorBase {
   bool external_kill_ = false;
   // Network violation occurred and process of killing sandboxee started
   bool network_violation_ = false;
-  // Is the sandboxee timed out
+  // Whether the sandboxee timed out
   bool timed_out_ = false;
 
   // Monitor thread object.
-  std::unique_ptr<std::thread> thread_;
+  sapi::Thread thread_;
 
   // Synchronizes monitor thread deletion and notifying the monitor.
   absl::Mutex notify_mutex_;
 
   size_t req_size_;
-  std::unique_ptr<seccomp_notif, decltype(std::free)*> req_{nullptr, std::free};
+  std::unique_ptr<seccomp_notif, StdFreeDeleter> req_;
+  size_t resp_size_;
+  std::unique_ptr<seccomp_notif_resp, StdFreeDeleter> resp_;
 };
 
 }  // namespace sandbox2

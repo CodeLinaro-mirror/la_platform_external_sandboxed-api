@@ -24,6 +24,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "sandboxed_api/tools/clang_generator/emitter_base.h"
 #include "sandboxed_api/tools/clang_generator/frontend_action_test_util.h"
 #include "sandboxed_api/tools/clang_generator/generator.h"
 #include "sandboxed_api/util/status_matchers.h"
@@ -144,6 +145,36 @@ TEST_F(EmitterTest, TypedefNames) {
       ElementsAre("typedef enum { kNone, kSome } E", "struct A { E member; }",
                   "typedef struct { int member; } B",
                   "struct tagC { int member; }", "typedef struct tagC C"));
+}
+
+TEST_F(EmitterTest, TypedefAnonymousWithFieldStructure) {
+  EmitterForTesting emitter;
+  ASSERT_THAT(
+      RunFrontendAction(
+          R"(struct A { int number; };
+             typedef struct { A member; } B;
+             extern "C" void Foo(B*);)",
+          std::make_unique<GeneratorAction>(emitter, GeneratorOptions())),
+      IsOk());
+
+  EXPECT_THAT(UglifyAll(emitter.SpellingsForNS("")),
+              ElementsAre("struct A { int number; }",
+                          "typedef struct { A member; } B"));
+}
+
+TEST_F(EmitterTest, NamedEnumWithoutTypedef) {
+  EmitterForTesting emitter;
+  ASSERT_THAT(
+      RunFrontendAction(
+          R"(enum Color { kRed, kGreen, kBlue };
+             typedef struct { enum Color member; } B;
+             extern "C" void Foo(B*);)",
+          std::make_unique<GeneratorAction>(emitter, GeneratorOptions())),
+      IsOk());
+
+  EXPECT_THAT(UglifyAll(emitter.SpellingsForNS("")),
+              ElementsAre("enum Color { kRed, kGreen, kBlue }",
+                          "typedef struct { enum Color member; } B"));
 }
 
 TEST_F(EmitterTest, NestedStruct) {

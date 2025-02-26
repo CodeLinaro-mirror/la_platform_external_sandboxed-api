@@ -20,7 +20,6 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sched.h>
-#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -114,6 +113,17 @@ void MoveFDs(std::initializer_list<std::pair<int*, int>> move_fds,
   }
 }
 
+struct Pipe {
+  FDCloser read;
+  FDCloser write;
+};
+
+Pipe CreatePipe() {
+  int pfds[2];
+  SAPI_RAW_PCHECK(pipe(pfds) == 0, "creating pipe");
+  return {FDCloser(pfds[0]), FDCloser(pfds[1])};
+}
+
 ABSL_ATTRIBUTE_NORETURN void RunInitProcess(pid_t main_pid, FDCloser pipe_fd) {
   if (prctl(PR_SET_NAME, "S2-INIT-PROC", 0, 0, 0) != 0) {
     SAPI_RAW_PLOG(WARNING, "prctl(PR_SET_NAME, 'S2-INIT-PROC')");
@@ -142,8 +152,9 @@ ABSL_ATTRIBUTE_NORETURN void RunInitProcess(pid_t main_pid, FDCloser pipe_fd) {
   }
   code.push_back(DENY);
 
-  struct sock_fprog prog {
-    .len = static_cast<uint16_t>(code.size()), .filter = code.data(),
+  struct sock_fprog prog{
+      .len = static_cast<uint16_t>(code.size()),
+      .filter = code.data(),
   };
 
   SAPI_RAW_CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0,
@@ -164,12 +175,12 @@ ABSL_ATTRIBUTE_NORETURN void RunInitProcess(pid_t main_pid, FDCloser pipe_fd) {
 
     if (info.si_pid == main_pid) {
       if (pipe_fd.get() >= 0) {
-        write(pipe_fd.get(), &info.si_code, sizeof(info.si_code));
-        write(pipe_fd.get(), &info.si_status, sizeof(info.si_status));
+        (void)write(pipe_fd.get(), &info.si_code, sizeof(info.si_code));
+        (void)write(pipe_fd.get(), &info.si_status, sizeof(info.si_status));
 
         rusage usage{};
         getrusage(RUSAGE_CHILDREN, &usage);
-        write(pipe_fd.get(), &usage, sizeof(usage));
+        (void)write(pipe_fd.get(), &usage, sizeof(usage));
       }
       _exit(0);
     }
@@ -193,8 +204,8 @@ absl::StatusOr<pid_t> ReceivePid(int signaling_fd) {
     char ctrl[CMSG_SPACE(sizeof(struct ucred))];
   } ucred_msg{};
 
-  struct msghdr msgh {};
-  struct iovec iov {};
+  struct msghdr msgh{};
+  struct iovec iov{};
 
   msgh.msg_iov = &iov;
   msgh.msg_iovlen = 1;
@@ -323,7 +334,8 @@ void ForkServer::LaunchChild(const ForkRequest& request, int execve_fd,
   signaling_fd.Close();
   status_fd.Close();
 
-  Client c(comms_);
+  Client client(comms_);
+  client.allow_speculation_ = request.allow_speculation();
 
   // Prepare the arguments before sandboxing (if needed), as doing it after
   // sandoxing can cause syscall violations (e.g. related to memory management).
@@ -342,12 +354,12 @@ void ForkServer::LaunchChild(const ForkRequest& request, int execve_fd,
     // The following client calls are basically SandboxMeHere. We split it so
     // that we can set up the envp after we received the file descriptors but
     // before we enable the syscall filter.
-    c.PrepareEnvironment(&execve_fd);
+    client.PrepareEnvironment(&execve_fd);
     if (comms_->GetConnectionFD() != Comms::kSandbox2ClientCommsFD) {
       envs.push_back(absl::StrCat(Comms::kSandbox2CommsFDEnvVar, "=",
                                   comms_->GetConnectionFD()));
     }
-    envs.push_back(c.GetFdMapEnvVar());
+    envs.push_back(client.GetFdMapEnvVar());
   }
 
   // Convert args and envs before enabling sandbox (it'll allocate which might
@@ -356,7 +368,7 @@ void ForkServer::LaunchChild(const ForkRequest& request, int execve_fd,
   util::CharPtrArray envp = util::CharPtrArray::FromStringVector(envs);
 
   if (should_sandbox) {
-    c.EnableSandbox();
+    client.EnableSandbox();
   }
 
   if (will_execve) {
@@ -393,21 +405,16 @@ pid_t ForkServer::ServeRequest() {
   uid_t uid = getuid();
   uid_t gid = getgid();
 
-  FDCloser pipe_fds[2];
-  {
-    int pfds[2] = {-1, -1};
-    if (fork_request.monitor_type() == FORKSERVER_MONITOR_UNOTIFY) {
-      SAPI_RAW_PCHECK(pipe(pfds) == 0, "creating status pipe");
-    }
-    pipe_fds[0] = FDCloser(pfds[0]);
-    pipe_fds[1] = FDCloser(pfds[1]);
+  Pipe pipe_fds;
+  if (fork_request.monitor_type() == FORKSERVER_MONITOR_UNOTIFY) {
+    pipe_fds = CreatePipe();
   }
 
   int socketpair_fds[2];
   SAPI_RAW_PCHECK(
       socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socketpair_fds) == 0,
       "creating signaling socketpair");
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 2; ++i) {
     int val = 1;
     SAPI_RAW_PCHECK(setsockopt(socketpair_fds[i], SOL_SOCKET, SO_PASSCRED, &val,
                                sizeof(val)) == 0,
@@ -428,6 +435,10 @@ pid_t ForkServer::ServeRequest() {
     if (initial_mntns_fd_ == -1) {
       CreateInitialNamespaces();
     }
+    if (fork_request.netns_mode() == NETNS_MODE_SHARED_PER_FORKSERVER &&
+        initial_netns_fd_ == -1) {
+      CreateForkserverSharedNetworkNamespace();
+    }
     // We first just fork a child, which will join the initial namespaces
     // Note: Not a regular fork() as one really needs to be single-threaded to
     //       setns and this is not the case with TSAN.
@@ -438,6 +449,11 @@ pid_t ForkServer::ServeRequest() {
                       "joining initial user namespace");
       SAPI_RAW_PCHECK(setns(initial_mntns_fd_, CLONE_NEWNS) != -1,
                       "joining initial mnt namespace");
+      if (fork_request.netns_mode() == NETNS_MODE_SHARED_PER_FORKSERVER) {
+        SAPI_RAW_PCHECK(setns(initial_netns_fd_, CLONE_NEWNET) != -1,
+                        "joining initial net namespace");
+        close(initial_netns_fd_);
+      }
       close(initial_userns_fd_);
       close(initial_mntns_fd_);
       // Do not create new userns it will be unshared later
@@ -468,21 +484,21 @@ pid_t ForkServer::ServeRequest() {
   // Child.
   if (sandboxee_pid == 0) {
     signaling_fds[0].Close();
-    pipe_fds[0].Close();
+    pipe_fds.read.Close();
     // Make sure we override the forkserver's comms fd
     comms_->Terminate();
     if (exec_fd != -1) {
       int signaling_fd = signaling_fds[1].Release();
-      int pipe_fd = pipe_fds[1].Release();
+      int pipe_fd = pipe_fds.write.Release();
       MoveFDs({{&exec_fd, Comms::kSandbox2TargetExecFD},
                {&comms_fd, Comms::kSandbox2ClientCommsFD}},
               {&signaling_fd, &pipe_fd});
       signaling_fds[1] = FDCloser(signaling_fd);
-      pipe_fds[1] = FDCloser(pipe_fd);
+      pipe_fds.write = FDCloser(pipe_fd);
     }
     *comms_ = Comms(comms_fd);
     LaunchChild(fork_request, exec_fd, uid, gid, std::move(signaling_fds[1]),
-                std::move(pipe_fds[1]), avoid_pivot_root);
+                std::move(pipe_fds.write), avoid_pivot_root);
     return sandboxee_pid;
   }
 
@@ -515,7 +531,7 @@ pid_t ForkServer::ServeRequest() {
   }
 
   // Parent.
-  pipe_fds[1].Close();
+  pipe_fds.write.Close();
   close(comms_fd);
   if (exec_fd >= 0) {
     close(exec_fd);
@@ -526,8 +542,8 @@ pid_t ForkServer::ServeRequest() {
       comms_->SendInt32(sandboxee_pid),
       absl::StrCat("Failed to send sandboxee PID: ", sandboxee_pid).c_str());
 
-  if (pipe_fds[0].get() >= 0) {
-    SAPI_RAW_CHECK(comms_->SendFD(pipe_fds[0].get()),
+  if (pipe_fds.read.get() >= 0) {
+    SAPI_RAW_CHECK(comms_->SendFD(pipe_fds.read.get()),
                    "Failed to send status pipe");
   }
   return sandboxee_pid;
@@ -595,10 +611,8 @@ void ForkServer::CreateInitialNamespaces() {
   gid_t gid = getgid();
 
   // Socket to synchronize so that we open ns fds before process dies
-  FDCloser create_efd(eventfd(0, EFD_CLOEXEC));
-  SAPI_RAW_PCHECK(create_efd.get() != -1, "creating eventfd");
-  FDCloser open_efd(eventfd(0, EFD_CLOEXEC));
-  SAPI_RAW_PCHECK(open_efd.get() != -1, "creating eventfd");
+  Pipe create_pipe = CreatePipe();
+  Pipe open_pipe = CreatePipe();
   pid_t pid = util::ForkWithFlags(CLONE_NEWUSER | CLONE_NEWNS | SIGCHLD);
   if (pid == -1 && errno == EPERM && IsLikelyChrooted()) {
     SAPI_RAW_LOG(FATAL,
@@ -606,13 +620,15 @@ void ForkServer::CreateInitialNamespaces() {
                  "likely chrooted");
   }
   SAPI_RAW_PCHECK(pid != -1, "failed to fork initial namespaces process");
-  uint64_t value = 1;
+  char value = ' ';
   if (pid == 0) {
+    create_pipe.read.Close();
+    open_pipe.write.Close();
     Namespace::InitializeInitialNamespaces(uid, gid);
-    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(create_efd.get(), &value,
+    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(create_pipe.write.get(), &value,
                                              sizeof(value))) == sizeof(value),
                     "synchronizing initial namespaces creation");
-    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(open_efd.get(), &value,
+    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(open_pipe.read.get(), &value,
                                             sizeof(value))) == sizeof(value),
                     "synchronizing initial namespaces creation");
     SAPI_RAW_PCHECK(chroot("/realroot") == 0,
@@ -620,7 +636,9 @@ void ForkServer::CreateInitialNamespaces() {
     util::DumpCoverageData();
     _exit(0);
   }
-  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(create_efd.get(), &value,
+  open_pipe.read.Close();
+  create_pipe.write.Close();
+  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(create_pipe.read.get(), &value,
                                           sizeof(value))) == sizeof(value),
                   "synchronizing initial namespaces creation");
   initial_userns_fd_ = open(absl::StrCat("/proc/", pid, "/ns/user").c_str(),
@@ -629,7 +647,41 @@ void ForkServer::CreateInitialNamespaces() {
   initial_mntns_fd_ = open(absl::StrCat("/proc/", pid, "/ns/mnt").c_str(),
                            O_RDONLY | O_CLOEXEC);
   SAPI_RAW_PCHECK(initial_mntns_fd_ != -1, "getting initial mntns fd");
-  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(open_efd.get(), &value,
+  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(open_pipe.write.get(), &value,
+                                           sizeof(value))) == sizeof(value),
+                  "synchronizing initial namespaces creation");
+}
+
+void ForkServer::CreateForkserverSharedNetworkNamespace() {
+  Pipe create_pipe = CreatePipe();
+  Pipe open_pipe = CreatePipe();
+  pid_t pid = util::ForkWithFlags(SIGCHLD);
+  SAPI_RAW_PCHECK(pid != -1, "failed to fork shared netns process");
+  char value = ' ';
+  if (pid == 0) {
+    create_pipe.read.Close();
+    open_pipe.write.Close();
+    SAPI_RAW_PCHECK(setns(initial_userns_fd_, CLONE_NEWUSER) == 0,
+                    "joining initial user namespace");
+    SAPI_RAW_PCHECK(unshare(CLONE_NEWNET) == 0, "unsharing netns");
+    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(create_pipe.write.get(), &value,
+                                             sizeof(value))) == sizeof(value),
+                    "synchronizing shared netns creation");
+    SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(open_pipe.read.get(), &value,
+                                            sizeof(value))) == sizeof(value),
+                    "synchronizing shared netns creation");
+    util::DumpCoverageData();
+    _exit(0);
+  }
+  open_pipe.read.Close();
+  create_pipe.write.Close();
+  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(read(create_pipe.read.get(), &value,
+                                          sizeof(value))) == sizeof(value),
+                  "synchronizing shared netns creation");
+  initial_netns_fd_ = open(absl::StrCat("/proc/", pid, "/ns/net").c_str(),
+                           O_RDONLY | O_CLOEXEC);
+  SAPI_RAW_PCHECK(initial_netns_fd_ != -1, "getting initial netns fd");
+  SAPI_RAW_PCHECK(TEMP_FAILURE_RETRY(write(open_pipe.write.get(), &value,
                                            sizeof(value))) == sizeof(value),
                   "synchronizing initial namespaces creation");
 }

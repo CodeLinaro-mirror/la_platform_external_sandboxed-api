@@ -22,8 +22,10 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <syscall.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -35,20 +37,13 @@
 #include "absl/strings/string_view.h"
 #include "sandboxed_api/config.h"
 #include "sandboxed_api/sandbox2/bpfdisassembler.h"
-#include "sandboxed_api/sandbox2/comms.h"
 #include "sandboxed_api/sandbox2/syscall.h"
+#include "sandboxed_api/sandbox2/util.h"
 #include "sandboxed_api/sandbox2/util/bpf_helper.h"
-#include "sandboxed_api/util/raw_logging.h"
 
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
 #endif
-
-#ifndef SECCOMP_RET_USER_NOTIF
-#define SECCOMP_RET_USER_NOTIF 0x7fc00000U /* notifies userspace */
-#endif
-
-#define DO_USER_NOTIF BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF)
 
 ABSL_FLAG(bool, sandbox2_danger_danger_permit_all, false,
           "Allow all syscalls, useful for testing");
@@ -81,15 +76,6 @@ std::vector<sock_filter> Policy::GetPolicy(bool user_notif) const {
   // 3. Finish with default KILL action.
   policy.push_back(KILL);
 
-  // In seccomp_unotify mode replace all KILLS with unotify
-  if (user_notif) {
-    for (sock_filter& filter : policy) {
-      if (filter.code == BPF_RET + BPF_K && filter.k == SECCOMP_RET_KILL) {
-        filter = DO_USER_NOTIF;
-      }
-    }
-  }
-
   VLOG(2) << "Final policy:\n" << bpf::Disasm(policy);
   return policy;
 }
@@ -100,7 +86,6 @@ std::vector<sock_filter> Policy::GetPolicy(bool user_notif) const {
 // Produces a policy which returns SECCOMP_RET_TRACE instead of SECCOMP_RET_KILL
 // for the __NR_execve syscall, so the tracer can make a decision to allow or
 // disallow it depending on which occurrence of __NR_execve it was.
-// LINT.IfChange
 std::vector<sock_filter> Policy::GetDefaultPolicy(bool user_notif) const {
   bpf_labels l = {0};
 
@@ -112,7 +97,6 @@ std::vector<sock_filter> Policy::GetDefaultPolicy(bool user_notif) const {
         LOAD_ARCH,
         JNE32(Syscall::GetHostAuditArch(), DENY),
         LOAD_SYSCALL_NR,
-        // TODO(b/271400371) Use NOTIF_FLAG_CONTINUE once generally available
         JNE32(__NR_seccomp, JUMP(&l, past_seccomp_l)),
         ARG_32(3),
         JNE32(internal::kExecveMagic, JUMP(&l, past_seccomp_l)),
@@ -131,33 +115,42 @@ std::vector<sock_filter> Policy::GetDefaultPolicy(bool user_notif) const {
     };
   } else {
     policy = {
-      // If compiled arch is different from the runtime one, inform the Monitor.
-      LOAD_ARCH,
-      JEQ32(Syscall::GetHostAuditArch(), JUMP(&l, past_arch_check_l)),
+        // If compiled arch is different from the runtime one, inform the
+        // Monitor.
+        LOAD_ARCH,
+        JEQ32(Syscall::GetHostAuditArch(), JUMP(&l, past_arch_check_l)),
 #if defined(SAPI_X86_64)
-      JEQ32(AUDIT_ARCH_I386, TRACE(sapi::cpu::kX86)),  // 32-bit sandboxee
+        JEQ32(AUDIT_ARCH_I386, TRACE(sapi::cpu::kX86)),  // 32-bit sandboxee
 #endif
-      TRACE(sapi::cpu::kUnknown),
-      LABEL(&l, past_arch_check_l),
+        TRACE(sapi::cpu::kUnknown),
+        LABEL(&l, past_arch_check_l),
 
-      // After the policy is uploaded, forkserver will execve the sandboxee. We
-      // need to allow this execve but not others. Since BPF does not have
-      // state, we need to inform the Monitor to decide, and for that we use a
-      // magic value in syscall args 5. Note that this value is not supposed to
-      // be secret, but just an optimization so that the monitor is not
-      // triggered on every call to execveat.
-      LOAD_SYSCALL_NR,
-      JNE32(__NR_execveat, JUMP(&l, past_execveat_l)),
-      ARG_32(4),
-      JNE32(AT_EMPTY_PATH, JUMP(&l, past_execveat_l)),
-      ARG_32(5),
-      JNE32(internal::kExecveMagic, JUMP(&l, past_execveat_l)),
-      SANDBOX2_TRACE,
-      LABEL(&l, past_execveat_l),
+        // After the policy is uploaded, forkserver will execve the sandboxee.
+        // We need to allow this execve but not others. Since BPF does not have
+        // state, we need to inform the Monitor to decide, and for that we use a
+        // magic value in syscall args 5. Note that this value is not supposed
+        // to be secret, but just an optimization so that the monitor is not
+        // triggered on every call to execveat.
+        LOAD_SYSCALL_NR,
+        JNE32(__NR_execveat, JUMP(&l, past_execveat_l)),
+        ARG_32(4),
+        JNE32(AT_EMPTY_PATH, JUMP(&l, past_execveat_l)),
+        ARG_32(5),
+        JNE32(internal::kExecveMagic, JUMP(&l, past_execveat_l)),
+        SANDBOX2_TRACE,
+        LABEL(&l, past_execveat_l),
 
-      LOAD_SYSCALL_NR,
+        LOAD_SYSCALL_NR,
     };
   }
+
+  // Insert a custom syscall to signal the sandboxee it's running inside a
+  // sandbox.
+  // Executing a syscall with ID util::kMagicSyscallNo will return
+  // util::kMagicSyscallErr when the call by the sandboxee code is made inside
+  // the sandbox and ENOSYS when it is not inside the sandbox.
+  policy.insert(policy.end(), {SYSCALL(internal::kMagicSyscallNo,
+                                       ERRNO(internal::kMagicSyscallErr))});
 
   // Forbid ptrace because it's unsafe or too risky. The user policy can only
   // block (i.e. return an error instead of killing the process) but not allow
@@ -167,10 +160,36 @@ std::vector<sock_filter> Policy::GetDefaultPolicy(bool user_notif) const {
   }
 
   // If user policy doesn't mention it, then forbid bpf because it's unsafe or
-  // too risky.  This uses LOAD_SYSCALL_NR from above.
+  // too risky. This uses LOAD_SYSCALL_NR from above.
   if (!user_policy_handles_bpf_) {
     policy.insert(policy.end(), {JEQ32(__NR_bpf, DENY)});
   }
+
+  if (!allow_map_exec_) {
+    policy.insert(
+        policy.end(),
+        {
+#ifdef __NR_mmap
+            JNE32(__NR_mmap, JUMP(&l, past_map_exec_l)),
+#endif
+#ifdef __NR_mmap2  // Arm32
+            JNE32(__NR_mmap2, JUMP(&l, past_map_exec_l)),
+#endif
+            JNE32(__NR_mprotect, JUMP(&l, past_map_exec_l)),
+#ifdef __NR_pkey_mprotect
+            JNE32(__NR_pkey_mprotect, JUMP(&l, past_map_exec_l)),
+#endif
+            // Load "prot" argument, which is the same for all four syscalls.
+            ARG_32(2),
+            // Deny executable mappings. This also disallows them for all PKEYS
+            // (not just the default one).
+            JA32(PROT_EXEC, DENY),
+
+            LABEL(&l, past_map_exec_l),
+            LOAD_SYSCALL_NR,
+        });
+  }
+
 #ifndef CLONE_NEWCGROUP
 #define CLONE_NEWCGROUP 0x02000000
 #endif
@@ -220,49 +239,22 @@ std::vector<sock_filter> Policy::GetDefaultPolicy(bool user_notif) const {
 
   return policy;
 }
-// LINT.ThenChange(monitor_ptrace.cc)
 
 std::vector<sock_filter> Policy::GetTrackingPolicy() const {
   return {
-    LOAD_ARCH,
+      LOAD_ARCH,
 #if defined(SAPI_X86_64)
-        JEQ32(AUDIT_ARCH_X86_64, TRACE(sapi::cpu::kX8664)),
-        JEQ32(AUDIT_ARCH_I386, TRACE(sapi::cpu::kX86)),
+      JEQ32(AUDIT_ARCH_X86_64, TRACE(sapi::cpu::kX8664)),
+      JEQ32(AUDIT_ARCH_I386, TRACE(sapi::cpu::kX86)),
 #elif defined(SAPI_PPC64_LE)
-        JEQ32(AUDIT_ARCH_PPC64LE, TRACE(sapi::cpu::kPPC64LE)),
+      JEQ32(AUDIT_ARCH_PPC64LE, TRACE(sapi::cpu::kPPC64LE)),
 #elif defined(SAPI_ARM64)
-        JEQ32(AUDIT_ARCH_AARCH64, TRACE(sapi::cpu::kArm64)),
+      JEQ32(AUDIT_ARCH_AARCH64, TRACE(sapi::cpu::kArm64)),
 #elif defined(SAPI_ARM)
-        JEQ32(AUDIT_ARCH_ARM, TRACE(sapi::cpu::kArm)),
+      JEQ32(AUDIT_ARCH_ARM, TRACE(sapi::cpu::kArm)),
 #endif
-        TRACE(sapi::cpu::kUnknown),
+      TRACE(sapi::cpu::kUnknown),
   };
-}
-
-bool Policy::SendPolicy(Comms* comms, bool user_notif) const {
-  auto policy = GetPolicy(user_notif);
-  if (!comms->SendBytes(
-          reinterpret_cast<uint8_t*>(policy.data()),
-          static_cast<uint64_t>(policy.size()) * sizeof(sock_filter))) {
-    LOG(ERROR) << "Couldn't send policy";
-    return false;
-  }
-
-  return true;
-}
-
-void Policy::GetPolicyDescription(PolicyDescription* policy) const {
-  policy->set_user_bpf_policy(user_policy_.data(),
-                              user_policy_.size() * sizeof(sock_filter));
-  if (policy_builder_description_) {
-    *policy->mutable_policy_builder_description() =
-        *policy_builder_description_;
-  }
-
-  if (namespace_) {
-    namespace_->GetNamespaceDescription(
-        policy->mutable_namespace_description());
-  }
 }
 
 }  // namespace sandbox2
