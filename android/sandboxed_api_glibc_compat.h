@@ -40,3 +40,7 @@
 #ifndef PTRACE_O_EXITKILL
 #define PTRACE_O_EXITKILL (1 << 20)
 #endif
+
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
+#endif

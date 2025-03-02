@@ -13,34 +13,52 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/types.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
+#include <utility>
+#include <vector>
 
 #include "benchmark/benchmark.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "sandboxed_api/examples/stringop/stringop-sapi.sapi.h"
 #include "sandboxed_api/examples/stringop/stringop_params.pb.h"
 #include "sandboxed_api/examples/sum/sum-sapi.sapi.h"
 #include "sandboxed_api/sandbox.h"
+#include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/testing.h"
 #include "sandboxed_api/transaction.h"
+#include "sandboxed_api/util/status_macros.h"
 #include "sandboxed_api/util/status_matchers.h"
+#include "sandboxed_api/util/thread.h"
+#include "sandboxed_api/var_array.h"
+#include "sandboxed_api/var_int.h"
+#include "sandboxed_api/var_lenval.h"
+#include "sandboxed_api/var_reg.h"
+#include "sandboxed_api/var_struct.h"
 
 namespace sapi {
 namespace {
 
 using ::sapi::IsOk;
 using ::sapi::StatusIs;
+using ::testing::ContainerEq;
 using ::testing::Eq;
 using ::testing::Gt;
 using ::testing::HasSubstr;
+using ::testing::NotNull;
 
 // Functions that will be used during the benchmarks:
 
@@ -273,13 +291,13 @@ TEST(SandboxTest, NoRaceInConcurrentTerminate) {
   SumSandbox sandbox;
   ASSERT_THAT(sandbox.Init(), IsOk());
   SumApi api(&sandbox);
-  std::thread th([&sandbox] {
+  sapi::Thread th([&sandbox] {
     // Sleep so that the call already starts
     absl::SleepFor(absl::Seconds(1));
     sandbox.Terminate(/*attempt_graceful_exit=*/false);
   });
   EXPECT_THAT(api.sleep_for_sec(10), StatusIs(absl::StatusCode::kUnavailable));
-  th.join();
+  th.Join();
   const auto& result = sandbox.AwaitResult();
   EXPECT_THAT(result.final_status(), Eq(sandbox2::Result::EXTERNAL_KILL));
 }
@@ -301,6 +319,113 @@ TEST(SandboxTest, UseUnotifyMonitor) {
   // The sandbox should now be responsive again.
   SAPI_ASSERT_OK_AND_ASSIGN(int result, api.sum(1, 2));
   EXPECT_THAT(result, Eq(3));
+}
+
+TEST(SandboxTest, AllocateAndTransferTest) {
+  std::string test_string("This is a test");
+  std::vector<uint8_t> test_string_vector(test_string.begin(),
+                                          test_string.end());
+
+  absl::Span<uint8_t> buffer_input(
+      reinterpret_cast<uint8_t*>(test_string_vector.data()),
+      test_string_vector.size());
+  std::vector<uint8_t> buffer_output(test_string_vector.size());
+
+  SumSandbox sandbox;
+  ASSERT_THAT(sandbox.Init(), IsOk());
+  SumApi api(&sandbox);
+
+  SAPI_ASSERT_OK_AND_ASSIGN(
+      auto sapi_array, sandbox.AllocateAndTransferToSandboxee(buffer_input));
+  ASSERT_THAT(sapi_array, NotNull());
+  sapi::v::Array<const uint8_t> sapi_buffer_output(
+      reinterpret_cast<const uint8_t*>(buffer_output.data()),
+      buffer_output.size());
+  sapi_buffer_output.SetRemote(sapi_array->GetRemote());
+  ASSERT_THAT(sandbox.TransferFromSandboxee(&sapi_buffer_output), IsOk());
+  EXPECT_THAT(test_string_vector, ContainerEq(buffer_output));
+}
+
+TEST(SandboxTest, AllocateAndTransferTestLarge) {
+  const size_t kLargeSize = getpagesize() * (IOV_MAX + 1);
+  const std::string test_string(kLargeSize, 'A');
+  std::vector<uint8_t> test_string_vector(test_string.begin(),
+                                          test_string.end());
+
+  absl::Span<uint8_t> buffer_input(
+      reinterpret_cast<uint8_t*>(test_string_vector.data()),
+      test_string_vector.size());
+  std::vector<uint8_t> buffer_output(test_string_vector.size());
+
+  SumSandbox sandbox;
+  ASSERT_THAT(sandbox.Init(), IsOk());
+  SumApi api(&sandbox);
+
+  SAPI_ASSERT_OK_AND_ASSIGN(
+      auto sapi_array, sandbox.AllocateAndTransferToSandboxee(buffer_input));
+  ASSERT_THAT(sapi_array, NotNull());
+  sapi::v::Array<const uint8_t> sapi_buffer_output(
+      reinterpret_cast<const uint8_t*>(buffer_output.data()),
+      buffer_output.size());
+  sapi_buffer_output.SetRemote(sapi_array->GetRemote());
+  ASSERT_THAT(sandbox.TransferFromSandboxee(&sapi_buffer_output), IsOk());
+  EXPECT_THAT(test_string_vector, ContainerEq(buffer_output));
+}
+
+TEST(VarsTest, MoveOperations) {
+  {
+    v::Array<const uint8_t> array_orig(128);  // Allocates locally
+    const uint8_t* data_before = array_orig.GetData();
+
+    v::Array<const uint8_t> array_new(std::move(array_orig));
+    array_orig = std::move(array_new);  // Move back
+
+    const uint8_t* data_after = array_orig.GetData();
+    EXPECT_THAT(data_before, Eq(data_after));
+  }
+  {
+    constexpr absl::string_view kData = "Physcially fit";
+    v::LenVal len_val_orig(kData.data(), kData.size());
+    const uint8_t* data_before = len_val_orig.GetData();
+
+    v::LenVal len_val_new(std::move(len_val_orig));
+    len_val_orig = std::move(len_val_new);  // Move back
+
+    const uint8_t* data_after = len_val_orig.GetData();
+    EXPECT_THAT(data_before, Eq(data_after));
+  }
+  {
+    stringop::StringDuplication underlying_proto;
+    SAPI_ASSERT_OK_AND_ASSIGN(
+        auto proto_orig,
+        v::Proto<stringop::StringDuplication>::FromMessage(underlying_proto));
+
+    v::Proto<stringop::StringDuplication> proto_new(std::move(proto_orig));
+    proto_orig = std::move(proto_new);  // Move back
+  }
+  {
+    v::Reg<uint64_t> reg_orig(0x414141);
+    uint64_t value_before = reg_orig.GetValue();
+
+    v::Reg<uint64_t> reg_new(std::move(reg_orig));
+    reg_orig = std::move(reg_new);  // Move back
+
+    uint64_t value_after = reg_orig.GetValue();
+    EXPECT_THAT(value_before, Eq(value_after));
+  }
+  {
+    struct MyStruct {
+      int member = 0x414141;
+    };
+    v::Struct<MyStruct> struct_orig;
+    MyStruct* data_before = struct_orig.mutable_data();
+
+    v::Struct<MyStruct> struct_new(std::move(struct_orig));
+    struct_orig = std::move(struct_new);  // Move back
+
+    MyStruct* data_after = struct_orig.mutable_data();
+    EXPECT_THAT(data_before, Eq(data_after));
+  }
 }
 
 }  // namespace

@@ -21,7 +21,6 @@
 #include <csignal>
 #include <memory>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -41,6 +40,7 @@
 #include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/testing.h"
 #include "sandboxed_api/util/status_matchers.h"
+#include "sandboxed_api/util/thread.h"
 
 namespace sandbox2 {
 namespace {
@@ -50,6 +50,7 @@ using ::sapi::GetTestSourcePath;
 using ::sapi::IsOk;
 using ::testing::Eq;
 using ::testing::IsEmpty;
+using ::testing::IsFalse;
 using ::testing::IsTrue;
 using ::testing::Lt;
 using ::testing::Ne;
@@ -77,8 +78,10 @@ TEST_P(Sandbox2Test, AbortWithoutCoreDumpReturnsSignaled) {
   };
   auto executor = std::make_unique<Executor>(path, args);
 
-  SAPI_ASSERT_OK_AND_ASSIGN(auto policy, CreateDefaultTestPolicy(path)
-                                             .TryBuild());
+  SAPI_ASSERT_OK_AND_ASSIGN(
+      auto policy,
+      CreateDefaultTestPolicy(path)
+          .TryBuild());
   Sandbox2 sandbox(std::move(executor), std::move(policy));
   ASSERT_THAT(SetUpSandbox(&sandbox), IsOk());
   auto result = sandbox.Run();
@@ -121,6 +124,7 @@ TEST(ExecutorTest, ExecutorFdConstructor) {
   Sandbox2 sandbox(std::move(executor), std::move(policy));
   auto result = sandbox.Run();
 
+  EXPECT_THAT(sandbox.IsTerminated(), IsTrue());
   ASSERT_EQ(result.final_status(), Result::OK);
 }
 
@@ -137,11 +141,35 @@ TEST_P(Sandbox2Test, SandboxeeExternalKill) {
   Sandbox2 sandbox(std::move(executor), std::move(policy));
   ASSERT_THAT(SetUpSandbox(&sandbox), IsOk());
   ASSERT_TRUE(sandbox.RunAsync());
-  sleep(1);
+  EXPECT_THAT(sandbox.IsTerminated(), IsFalse());
+  absl::SleepFor(absl::Seconds(1));
   sandbox.Kill();
   auto result = sandbox.AwaitResult();
+  EXPECT_THAT(sandbox.IsTerminated(), IsTrue());
   EXPECT_EQ(result.final_status(), Result::EXTERNAL_KILL);
   EXPECT_THAT(result.stack_trace(), IsEmpty());
+}
+
+TEST_P(Sandbox2Test, SandboxeeKillDontAwait) {
+  const std::string path = GetTestSourcePath("sandbox2/testcases/sleep");
+
+  std::vector<std::string> args = {path};
+  auto executor = std::make_unique<Executor>(path, args);
+
+  SAPI_ASSERT_OK_AND_ASSIGN(auto policy,
+                            CreateDefaultTestPolicy(path).TryBuild());
+  absl::Time kill_time;
+  {
+    Sandbox2 sandbox(std::move(executor), std::move(policy));
+    ASSERT_THAT(SetUpSandbox(&sandbox), IsOk());
+    ASSERT_TRUE(sandbox.RunAsync());
+    EXPECT_THAT(sandbox.IsTerminated(), IsFalse());
+    absl::SleepFor(absl::Seconds(1));
+    sandbox.Kill();
+    kill_time = absl::Now();
+  }
+  absl::Duration elapsed = absl::Now() - kill_time;
+  EXPECT_THAT(elapsed, Lt(absl::Milliseconds(200)));
 }
 
 // Tests that we do not collect stack traces if it was disabled (signaled).
@@ -156,10 +184,13 @@ TEST_P(Sandbox2Test, SandboxeeTimeoutDisabledStacktraces) {
                                              .TryBuild());
   Sandbox2 sandbox(std::move(executor), std::move(policy));
   ASSERT_THAT(SetUpSandbox(&sandbox), IsOk());
+  absl::Time start_time = absl::Now();
   ASSERT_TRUE(sandbox.RunAsync());
   sandbox.set_walltime_limit(absl::Seconds(1));
   auto result = sandbox.AwaitResult();
   EXPECT_EQ(result.final_status(), Result::TIMEOUT);
+  auto elapsed = absl::Now() - start_time;
+  EXPECT_THAT(elapsed, Lt(absl::Seconds(2)));
   EXPECT_THAT(result.stack_trace(), IsEmpty());
 }
 
@@ -191,8 +222,8 @@ TEST_P(Sandbox2Test, SandboxeeNotKilledWhenStartingThreadFinishes) {
                             CreateDefaultTestPolicy(path).TryBuild());
   Sandbox2 sandbox(std::move(executor), std::move(policy));
   ASSERT_THAT(SetUpSandbox(&sandbox), IsOk());
-  std::thread sandbox_start_thread([&sandbox]() { sandbox.RunAsync(); });
-  sandbox_start_thread.join();
+  sapi::Thread sandbox_start_thread([&sandbox]() { sandbox.RunAsync(); });
+  sandbox_start_thread.Join();
   Result result = sandbox.AwaitResult();
   EXPECT_EQ(result.final_status(), Result::OK);
 }
