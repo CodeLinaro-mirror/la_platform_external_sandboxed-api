@@ -17,16 +17,16 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
 #include <string>
 #include <type_traits>
 
 #include "absl/strings/str_format.h"
 #include "sandboxed_api/var_abstract.h"
+#include "sandboxed_api/var_type.h"
 
 namespace sapi::v {
 
-// The super-class for Reg. Specified as a class, so it can be used as a
+// The superclass for Reg. Specified as a class, so it can be used as a
 // type specifier in methods.
 class Callable : public Var {
  public:
@@ -46,7 +46,7 @@ class Callable : public Var {
   Callable() = default;
 };
 
-// class Reg represents register-sized variables.
+// Class Reg represents register-sized variables.
 template <typename T>
 class Reg : public Callable {
  public:
@@ -126,7 +126,7 @@ std::string Reg<T>::ToString() const {
   if constexpr (std::is_pointer<T>::value) {
     return absl::StrFormat("%p", value_);
   }
-  // Not reached.
+  // Not reached
 }
 
 }  // namespace sapi::v

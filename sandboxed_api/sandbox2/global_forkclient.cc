@@ -147,7 +147,7 @@ int LaunchForkserver(void* vargs) {
 absl::StatusOr<std::unique_ptr<GlobalForkClient>> StartGlobalForkServer() {
   SAPI_RAW_LOG(INFO, "Starting global forkserver");
 
-  // Allow passing of a spearate forkserver_bin via flag
+  // Allow passing of a separate forkserver_bin via flag
   int exec_fd = -1;
   std::string bin_path = absl::GetFlag(FLAGS_sandbox2_forkserver_binary_path);
   if (!bin_path.empty()) {
@@ -158,10 +158,6 @@ absl::StatusOr<std::unique_ptr<GlobalForkClient>> StartGlobalForkServer() {
                               "--sandbox2_forkserver_binary_path (",
                               bin_path, ")"));
     }
-  } else if constexpr (sapi::host_os::IsAndroid()) {
-    return absl::FailedPreconditionError(
-        "sandbox2_forkserver_binary_path flag has to be set to the location of "
-        "the forkserver binary on Android");
   }
   if (exec_fd < 0) {
     // Extract the fd when it's owned by EmbedFile

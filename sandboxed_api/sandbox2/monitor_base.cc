@@ -37,6 +37,7 @@
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -47,6 +48,7 @@
 #include "sandboxed_api/sandbox2/client.h"
 #include "sandboxed_api/sandbox2/comms.h"
 #include "sandboxed_api/sandbox2/executor.h"
+#include "sandboxed_api/sandbox2/forkserver.pb.h"
 #include "sandboxed_api/sandbox2/limits.h"
 #include "sandboxed_api/sandbox2/mounts.h"
 #include "sandboxed_api/sandbox2/namespace.h"
@@ -59,9 +61,9 @@
 #include "sandboxed_api/sandbox2/syscall.h"
 #include "sandboxed_api/sandbox2/util.h"
 #include "sandboxed_api/util/file_helpers.h"
-#include "sandboxed_api/util/raw_logging.h"
 #include "sandboxed_api/util/strerror.h"
 #include "sandboxed_api/util/temp_file.h"
+#include "sandboxed_api/util/thread.h"
 
 ABSL_FLAG(bool, sandbox2_report_on_sandboxee_signal, true,
           "Report sandbox2 sandboxee deaths caused by signals");
@@ -71,8 +73,6 @@ ABSL_FLAG(bool, sandbox2_report_on_sandboxee_timeout, true,
 
 ABSL_DECLARE_FLAG(bool, sandbox2_danger_danger_permit_all);
 ABSL_DECLARE_FLAG(std::string, sandbox2_danger_danger_permit_all_and_log);
-
-ABSL_DECLARE_FLAG(bool, sandbox_libunwind_crash_handler);
 
 namespace sandbox2 {
 namespace {
@@ -157,8 +157,8 @@ MonitorBase::~MonitorBase() {
   if (log_file_) {
     std::fclose(log_file_);
   }
-  if (network_proxy_server_) {
-    network_proxy_thread_.join();
+  if (network_proxy_thread_.IsJoinable()) {
+    network_proxy_thread_.Join();
   }
 }
 
@@ -184,7 +184,7 @@ void MonitorBase::Launch() {
   absl::Cleanup monitor_done = [this] { OnDone(); };
 
   const Namespace* ns = policy_->GetNamespaceOrNull();
-  if (SAPI_VLOG_IS_ON(1) && ns != nullptr) {
+  if (VLOG_IS_ON(1) && ns != nullptr) {
     std::vector<std::string> outside_entries;
     std::vector<std::string> inside_entries;
     ns->mounts().RecursivelyListMounts(
@@ -206,8 +206,8 @@ void MonitorBase::Launch() {
 
   // Get PID of the sandboxee.
   bool should_have_init = ns && (ns->clone_flags() & CLONE_NEWPID);
-  absl::StatusOr<SandboxeeProcess> process =
-      executor_->StartSubProcess(clone_flags, ns, type_);
+  absl::StatusOr<SandboxeeProcess> process = executor_->StartSubProcess(
+      clone_flags, ns, policy_->allow_speculation_, type_);
 
   if (!process.ok()) {
     LOG(ERROR) << "Starting sandboxed subprocess failed: " << process.status();
@@ -269,12 +269,22 @@ void MonitorBase::SetExitStatusCode(Result::StatusEnum final_status,
   result_.SetExitStatusCode(final_status, reason_code);
 }
 
+absl::Status MonitorBase::SendPolicy(const std::vector<sock_filter>& policy) {
+  if (!comms_->SendBytes(reinterpret_cast<const uint8_t*>(policy.data()),
+                         policy.size() * sizeof(sock_filter))) {
+    return absl::InternalError("Error while sending policy via comms");
+  }
+  return absl::OkStatus();
+}
+
 bool MonitorBase::InitSendPolicy() {
-  if (!policy_->SendPolicy(comms_, type_ == FORKSERVER_MONITOR_UNOTIFY)) {
-    LOG(ERROR) << "Couldn't send policy";
+  bool user_notif = type_ == FORKSERVER_MONITOR_UNOTIFY;
+  auto policy = policy_->GetPolicy(user_notif);
+  absl::Status status = SendPolicy(std::move(policy));
+  if (!status.ok()) {
+    LOG(ERROR) << "Couldn't send policy: " << status;
     return false;
   }
-
   return true;
 }
 
@@ -289,11 +299,7 @@ bool MonitorBase::InitSendCwd() {
 
 bool MonitorBase::InitApplyLimit(pid_t pid, int resource,
                                  const rlimit64& rlim) const {
-#if defined(__ANDROID__)
-  using RlimitResource = int;
-#else
   using RlimitResource = __rlimit_resource;
-#endif
 
   rlimit64 curr_limit;
   if (prlimit64(pid, static_cast<RlimitResource>(resource), nullptr,
@@ -333,13 +339,13 @@ bool MonitorBase::InitApplyLimits() {
 bool MonitorBase::InitSendIPC() { return ipc_->SendFdsOverComms(); }
 
 bool MonitorBase::WaitForSandboxReady() {
-  uint32_t tmp;
-  if (!comms_->RecvUint32(&tmp)) {
+  uint32_t message;
+  if (!comms_->RecvUint32(&message)) {
     LOG(ERROR) << "Couldn't receive 'Client::kClient2SandboxReady' message";
     return false;
   }
-  if (tmp != Client::kClient2SandboxReady) {
-    LOG(ERROR) << "Received " << tmp << " != Client::kClient2SandboxReady ("
+  if (message != Client::kClient2SandboxReady) {
+    LOG(ERROR) << "Received " << message << " != Client::kClient2SandboxReady ("
                << Client::kClient2SandboxReady << ")";
     return false;
   }
@@ -359,7 +365,7 @@ void MonitorBase::LogSyscallViolation(const Syscall& syscall) const {
   LOG(ERROR) << "SANDBOX VIOLATION : PID: " << syscall.pid() << ", PROG: '"
              << util::GetProgName(syscall.pid())
              << "' : " << syscall.GetDescription();
-  if (SAPI_VLOG_IS_ON(1)) {
+  if (VLOG_IS_ON(1)) {
     VLOG(1) << "Cmdline: " << util::GetCmdLine(syscall.pid());
     VLOG(1) << "Task Name: " << util::GetProcStatusLine(syscall.pid(), "Name");
     VLOG(1) << "Tgid: " << util::GetProcStatusLine(syscall.pid(), "Tgid");
@@ -401,9 +407,7 @@ void MonitorBase::LogSyscallViolationExplanation(const Syscall& syscall) const {
 bool MonitorBase::StackTraceCollectionPossible() const {
   // Only get the stacktrace if we are not in the libunwind sandbox (avoid
   // recursion).
-  if ((policy_->GetNamespace() ||
-       absl::GetFlag(FLAGS_sandbox_libunwind_crash_handler) == false) &&
-      executor_->libunwind_recursion_depth() <= 1) {
+  if (executor_->libunwind_recursion_depth() <= 1) {
     return true;
   }
   LOG(ERROR) << "Cannot collect stack trace. Unwind pid "
@@ -416,10 +420,12 @@ void MonitorBase::EnableNetworkProxyServer() {
   int fd = ipc_->ReceiveFd(NetworkProxyClient::kFDName);
 
   network_proxy_server_ = std::make_unique<NetworkProxyServer>(
-      fd, &policy_->allowed_hosts_.value(), pthread_self());
+      fd, &policy_->allowed_hosts_.value(),
+      [this] { NotifyNetworkViolation(); });
 
-  network_proxy_thread_ = std::thread(&NetworkProxyServer::Run,
-  network_proxy_server_.get());
+  network_proxy_thread_ =
+      sapi::Thread(network_proxy_server_.get(), &NetworkProxyServer::Run,
+                   "NetworkProxyServer");
 }
 
 bool MonitorBase::ShouldCollectStackTrace(Result::StatusEnum status) const {
