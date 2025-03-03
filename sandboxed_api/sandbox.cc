@@ -19,6 +19,8 @@
 #include <sys/uio.h>
 #include <syscall.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <initializer_list>
 #include <memory>
@@ -26,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "sandboxed_api/file_toc.h"
 #include "absl/base/dynamic_annotations.h"
 #include "absl/base/macros.h"
 #include "absl/log/log.h"
@@ -33,7 +36,11 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "sandboxed_api/call.h"
 #include "sandboxed_api/config.h"
 #include "sandboxed_api/embed_file.h"
 #include "sandboxed_api/rpcchannel.h"
@@ -42,14 +49,27 @@
 #include "sandboxed_api/sandbox2/policybuilder.h"
 #include "sandboxed_api/sandbox2/result.h"
 #include "sandboxed_api/sandbox2/sandbox2.h"
-#include "sandboxed_api/sandbox2/util/bpf_helper.h"
-#include "sandboxed_api/util/fileops.h"
+#include "sandboxed_api/sandbox2/util.h"
 #include "sandboxed_api/util/path.h"
-#include "sandboxed_api/util/raw_logging.h"
 #include "sandboxed_api/util/runfiles.h"
 #include "sandboxed_api/util/status_macros.h"
+#include "sandboxed_api/var_abstract.h"
+#include "sandboxed_api/var_array.h"
+#include "sandboxed_api/var_int.h"
+#include "sandboxed_api/var_ptr.h"
+#include "sandboxed_api/var_reg.h"
+#include "sandboxed_api/var_type.h"
 
 namespace sapi {
+
+Sandbox::Sandbox(const FileToc* embed_lib_toc) {
+  owned_fork_client_context_ =
+      std::make_unique<ForkClientContext>(embed_lib_toc);
+  fork_client_context_ = owned_fork_client_context_.get();
+}
+
+Sandbox::Sandbox(std::nullptr_t)
+    : Sandbox(static_cast<const FileToc*>(nullptr)) {}
 
 Sandbox::~Sandbox() {
   Terminate();
@@ -57,8 +77,16 @@ Sandbox::~Sandbox() {
   // and closes the comms object.
 }
 
+void Sandbox::SetForkClientContext(ForkClientContext* fork_client_context) {
+  fork_client_context_ = fork_client_context;
+  owned_fork_client_context_.reset();
+}
+
 // A generic policy which should work with majority of typical libraries, which
 // are single-threaded and require ~30 basic syscalls.
+//
+// IMPORTANT: This policy must be safe to use with
+// `Allow(sandbox2::UnrestrictedNetworking())`.
 void InitDefaultPolicyBuilder(sandbox2::PolicyBuilder* builder) {
   (*builder)
       .AllowRead()
@@ -98,8 +126,8 @@ void InitDefaultPolicyBuilder(sandbox2::PolicyBuilder* builder) {
                  << "(ASAN/MSAN/TSAN) sanitizer";
     builder->AllowLlvmSanitizers();
   }
-    builder->AddFile("/etc/localtime")
-        .AddTmpfs("/tmp", 1ULL << 30 /* 1GiB tmpfs (max size */);
+  builder->AddFile("/etc/localtime")
+      .AddTmpfs("/tmp", 1ULL << 30 /* 1GiB tmpfs (max size */);
 }
 
 void Sandbox::Terminate(bool attempt_graceful_exit) {
@@ -127,8 +155,10 @@ void Sandbox::Terminate(bool attempt_graceful_exit) {
     result = s2_->AwaitResult();
   }
 
-  if (result->final_status() == sandbox2::Result::OK &&
-      result->reason_code() == 0) {
+  if ((result->final_status() == sandbox2::Result::OK &&
+       result->reason_code() == 0) ||
+      (!attempt_graceful_exit &&
+       result->final_status() == sandbox2::Result::EXTERNAL_KILL)) {
     VLOG(2) << "Sandbox2 finished with: " << result->ToString();
   } else {
     LOG(WARNING) << "Sandbox2 finished with: " << result->ToString();
@@ -146,45 +176,52 @@ absl::Status Sandbox::Init(bool use_unotify_monitor) {
     return absl::OkStatus();
   }
 
-  // Initialize the forkserver if it is not already running.
-  if (!fork_client_) {
-    // If FileToc was specified, it will be used over any paths to the SAPI
-    // library.
-    std::string lib_path;
-    int embed_lib_fd = -1;
-    if (embed_lib_toc_ && !sapi::host_os::IsAndroid()) {
-      embed_lib_fd = EmbedFile::instance()->GetDupFdForFileToc(embed_lib_toc_);
-      if (embed_lib_fd == -1) {
-        PLOG(ERROR) << "Cannot create executable FD for TOC:'"
-                    << embed_lib_toc_->name << "'";
-        return absl::UnavailableError("Could not create executable FD");
+  sandbox2::ForkClient* fork_client;
+  {
+    absl::MutexLock lock(&fork_client_context_->mu_);
+    // Initialize the forkserver if it is not already running.
+    if (!fork_client_context_->client_) {
+      // If FileToc was specified, it will be used over any paths to the SAPI
+      // library.
+      std::string lib_path;
+      int embed_lib_fd = -1;
+      const FileToc* embed_lib_toc = fork_client_context_->embed_lib_toc_;
+      if (embed_lib_toc) {
+        embed_lib_fd = EmbedFile::instance()->GetDupFdForFileToc(embed_lib_toc);
+        if (embed_lib_fd == -1) {
+          PLOG(ERROR) << "Cannot create executable FD for TOC:'"
+                      << embed_lib_toc->name << "'";
+          return absl::UnavailableError("Could not create executable FD");
+        }
+        lib_path = embed_lib_toc->name;
+      } else {
+        lib_path = PathToSAPILib(GetLibPath());
+        if (lib_path.empty()) {
+          LOG(ERROR) << "SAPI library path is empty";
+          return absl::FailedPreconditionError("No SAPI library path given");
+        }
       }
-      lib_path = embed_lib_toc_->name;
-    } else {
-      lib_path = PathToSAPILib(GetLibPath());
-      if (lib_path.empty()) {
-        LOG(ERROR) << "SAPI library path is empty";
-        return absl::FailedPreconditionError("No SAPI library path given");
+      std::vector<std::string> args = {lib_path};
+      // Additional arguments, if needed.
+      GetArgs(&args);
+      std::vector<std::string> envs{};
+      // Additional envvars, if needed.
+      GetEnvs(&envs);
+
+      fork_client_context_->executor_ =
+          (embed_lib_fd >= 0)
+              ? std::make_unique<sandbox2::Executor>(embed_lib_fd, args, envs)
+              : std::make_unique<sandbox2::Executor>(lib_path, args, envs);
+
+      fork_client_context_->client_ =
+          fork_client_context_->executor_->StartForkServer();
+
+      if (!fork_client_context_->client_) {
+        LOG(ERROR) << "Could not start forkserver";
+        return absl::UnavailableError("Could not start the forkserver");
       }
     }
-    std::vector<std::string> args = {lib_path};
-    // Additional arguments, if needed.
-    GetArgs(&args);
-    std::vector<std::string> envs{};
-    // Additional envvars, if needed.
-    GetEnvs(&envs);
-
-    forkserver_executor_ =
-        (embed_lib_fd >= 0)
-            ? std::make_unique<sandbox2::Executor>(embed_lib_fd, args, envs)
-            : std::make_unique<sandbox2::Executor>(lib_path, args, envs);
-
-    fork_client_ = forkserver_executor_->StartForkServer();
-
-    if (!fork_client_) {
-      LOG(ERROR) << "Could not start forkserver";
-      return absl::UnavailableError("Could not start the forkserver");
-    }
+    fork_client = fork_client_context_->client_.get();
   }
 
     sandbox2::PolicyBuilder policy_builder;
@@ -195,7 +232,7 @@ absl::Status Sandbox::Init(bool use_unotify_monitor) {
   auto s2p = ModifyPolicy(&policy_builder);
 
   // Spawn new process from the forkserver.
-  auto executor = std::make_unique<sandbox2::Executor>(fork_client_.get());
+  auto executor = std::make_unique<sandbox2::Executor>(fork_client);
 
   executor
       // The client.cc code is capable of enabling sandboxing on its own.
@@ -224,6 +261,11 @@ absl::Status Sandbox::Init(bool use_unotify_monitor) {
   rpc_channel_ = std::make_unique<RPCChannel>(comms_);
 
   if (!res) {
+    // Allow recovering from a bad fork client state.
+    {
+      absl::MutexLock lock(&fork_client_context_->mu_);
+      fork_client_context_->client_.reset();
+    }
     Terminate();
     return absl::UnavailableError("Could not start the sandbox");
   }
@@ -422,6 +464,15 @@ absl::Status Sandbox::TransferFromSandboxee(v::Var* var) {
   return var->TransferFromSandboxee(rpc_channel(), pid());
 }
 
+absl::StatusOr<std::unique_ptr<sapi::v::Array<const uint8_t>>>
+Sandbox::AllocateAndTransferToSandboxee(absl::Span<const uint8_t> buffer) {
+  auto sapi_buffer = std::make_unique<sapi::v::Array<const uint8_t>>(
+      buffer.data(), buffer.size());
+  SAPI_RETURN_IF_ERROR(Allocate(sapi_buffer.get(), /*automatic_free=*/true));
+  SAPI_RETURN_IF_ERROR(TransferToSandboxee(sapi_buffer.get()));
+  return sapi_buffer;
+}
+
 absl::StatusOr<std::string> Sandbox::GetCString(const v::RemotePtr& str,
                                                 size_t max_length) {
   if (!is_active()) {
@@ -434,21 +485,11 @@ absl::StatusOr<std::string> Sandbox::GetCString(const v::RemotePtr& str,
         absl::StrCat("Target string too large: ", len, " > ", max_length));
   }
   std::string buffer(len, '\0');
-  struct iovec local = {
-      .iov_base = &buffer[0],
-      .iov_len = len,
-  };
-  struct iovec remote = {
-      .iov_base = str.GetValue(),
-      .iov_len = len,
-  };
-
-  ssize_t ret = process_vm_readv(pid_, &local, 1, &remote, 1, 0);
-  if (ret == -1) {
-    PLOG(WARNING) << "reading c-string failed: process_vm_readv(pid: " << pid_
-                  << " raddr: " << str.GetValue() << " size: " << len << ")";
-    return absl::UnavailableError("process_vm_readv failed");
-  }
+  SAPI_ASSIGN_OR_RETURN(
+      size_t ret,
+      sandbox2::util::ReadBytesFromPidInto(
+          pid_, reinterpret_cast<uintptr_t>(str.GetValue()),
+          absl::MakeSpan(reinterpret_cast<char*>(buffer.data()), len)));
   if (ret != len) {
     LOG(WARNING) << "partial read when reading c-string: process_vm_readv(pid: "
                  << pid_ << " raddr: " << str.GetValue() << " size: " << len
@@ -473,17 +514,6 @@ absl::Status Sandbox::SetWallTimeLimit(absl::Duration limit) const {
   }
   s2_->set_walltime_limit(limit);
   return absl::OkStatus();
-}
-
-void Sandbox::Exit() const {
-  if (!is_active()) {
-    return;
-  }
-  s2_->set_walltime_limit(absl::Seconds(1));
-  if (!rpc_channel_->Exit().ok()) {
-    LOG(WARNING) << "rpc_channel->Exit() failed, killing PID: " << pid();
-    s2_->Kill();
-  }
 }
 
 std::unique_ptr<sandbox2::Policy> Sandbox::ModifyPolicy(
