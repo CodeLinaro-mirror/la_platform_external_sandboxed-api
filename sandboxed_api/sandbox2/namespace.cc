@@ -34,7 +34,8 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
-#include "sandboxed_api/sandbox2/violation.pb.h"
+#include "sandboxed_api/sandbox2/forkserver.pb.h"
+#include "sandboxed_api/sandbox2/mounts.h"
 #include "sandboxed_api/util/fileops.h"
 #include "sandboxed_api/util/path.h"
 #include "sandboxed_api/util/raw_logging.h"
@@ -195,12 +196,16 @@ void LogFilesystem(const std::string& dir) {
 
 }  // namespace
 
-Namespace::Namespace(bool allow_unrestricted_networking, Mounts mounts,
-                     std::string hostname, bool allow_mount_propagation)
+Namespace::Namespace(Mounts mounts, std::string hostname,
+                     NetNsMode netns_config, bool allow_mount_propagation)
     : mounts_(std::move(mounts)),
       hostname_(std::move(hostname)),
-      allow_mount_propagation_(allow_mount_propagation) {
-  if (allow_unrestricted_networking) {
+      allow_mount_propagation_(allow_mount_propagation),
+      netns_config_(netns_config) {
+  // Remove the CLONE_NEWNET flag to allow networking, or for the shared netns.
+  // In the latter case, the flag will be added later on.
+  if (netns_config_ == NETNS_MODE_NONE ||
+      netns_config_ == NETNS_MODE_SHARED_PER_FORKSERVER) {
     clone_flags_ &= ~CLONE_NEWNET;
   }
 }
@@ -231,9 +236,10 @@ void Namespace::InitializeNamespaces(uid_t uid, gid_t gid, int32_t clone_flags,
     SAPI_RAW_PCHECK(chdir("/") != -1, "chdir / after chrooting real root");
   }
 
-  SAPI_RAW_PCHECK(mount("", "/proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
-                        nullptr) != -1,
-                  "Could not mount a new /proc"
+  SAPI_RAW_PCHECK(
+      mount("", "/proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID, nullptr) !=
+          -1,
+      "Could not mount a new /proc"
   );
 
   if (clone_flags & CLONE_NEWNET) {
@@ -351,12 +357,6 @@ void Namespace::InitializeInitialNamespaces(uid_t uid, gid_t gid) {
   SAPI_RAW_PCHECK(
       mount("/", "/", "", MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr) == 0,
       "remounting rootfs read-only failed");
-}
-
-void Namespace::GetNamespaceDescription(
-    NamespaceDescription* pb_description) const {
-  pb_description->set_clone_flags(clone_flags_);
-  *pb_description->mutable_mount_tree_mounts() = mounts_.GetMountTree();
 }
 
 }  // namespace sandbox2

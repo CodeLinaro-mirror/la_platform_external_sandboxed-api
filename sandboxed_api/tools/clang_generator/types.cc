@@ -14,6 +14,7 @@
 
 #include "sandboxed_api/tools/clang_generator/types.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,8 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/QualTypeNames.h"
 #include "clang/AST/Type.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/Support/Casting.h"
 
 namespace sapi {
 namespace {
@@ -46,6 +49,19 @@ void TypeCollector::RecordOrderedDecl(clang::TypeDecl* type_decl) {
 void TypeCollector::CollectRelatedTypes(clang::QualType qual) {
   if (!seen_.insert(qual)) {
     return;
+  }
+
+  if (const auto* record_type = qual->getAs<clang::RecordType>()) {
+    const clang::RecordDecl* decl = record_type->getDecl();
+    for (const clang::FieldDecl* field : decl->fields()) {
+      CollectRelatedTypes(field->getType());
+    }
+    // Do not collect structs/unions if they are declared within another
+    // record. The enclosing type is enough to reconstruct the AST when
+    // writing the header.
+    const clang::RecordDecl* outer = decl->getOuterLexicalRecordContext();
+    decl = outer ? outer : decl;
+    collected_.insert(clang::QualType(decl->getTypeForDecl(), 0));
   }
 
   if (const auto* typedef_type = qual->getAs<clang::TypedefType>()) {
@@ -96,20 +112,6 @@ void TypeCollector::CollectRelatedTypes(clang::QualType qual) {
     collected_.insert(qual);
     return;
   }
-
-  if (const auto* record_type = qual->getAs<clang::RecordType>()) {
-    const clang::RecordDecl* decl = record_type->getDecl();
-    for (const clang::FieldDecl* field : decl->fields()) {
-      CollectRelatedTypes(field->getType());
-    }
-    // Do not collect structs/unions if they are declared within another
-    // record. The enclosing type is enough to reconstruct the AST when
-    // writing the header.
-    const clang::RecordDecl* outer = decl->getOuterLexicalRecordContext();
-    decl = outer ? outer : decl;
-    collected_.insert(clang::QualType(decl->getTypeForDecl(), 0));
-    return;
-  }
 }
 
 namespace {
@@ -123,6 +125,15 @@ std::string GetQualTypeName(const clang::ASTContext& context,
   if (unqual->isFunctionPointerType() || IsFunctionReferenceType(unqual) ||
       unqual->isMemberFunctionPointerType()) {
     unqual = unqual->getPointeeType();
+  }
+
+  if (unqual->isEnumeralType()) {
+    auto decl = unqual->getAsTagDecl();
+    if (decl) {
+      clang::PrintingPolicy policy = context.getPrintingPolicy();
+      policy.SuppressTagKeyword = false;  // keep enum keyword.
+      return clang::TypeName::getFullyQualifiedName(unqual, context, policy);
+    }
   }
   return clang::TypeName::getFullyQualifiedName(unqual, context,
                                                 context.getPrintingPolicy());
