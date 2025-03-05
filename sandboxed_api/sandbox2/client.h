@@ -35,12 +35,15 @@ class Client {
  public:
   // Client is ready to be sandboxed.
   static constexpr uint32_t kClient2SandboxReady = 0x0A0B0C01;
+
   // Sandbox is ready to monitor the sandboxee.
   static constexpr uint32_t kSandbox2ClientDone = 0x0A0B0C02;
-  // Sandboxe should setup seccomp_unotify and send back the FD.
+
+  // Sandboxee should setup seccomp_unotify and send back the FD.
   static constexpr uint32_t kSandbox2ClientUnotify = 0x0A0B0C03;
 
   explicit Client(Comms* comms);
+  virtual ~Client() = default;
 
   Client(const Client&) = delete;
   Client& operator=(const Client&) = delete;
@@ -109,6 +112,8 @@ class Client {
 
   void PrepareEnvironment(int* preserved_fd = nullptr);
   void EnableSandbox();
+
+  bool allow_speculation_ = false;
 };
 
 }  // namespace sandbox2

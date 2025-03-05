@@ -38,9 +38,9 @@
 #include "sandboxed_api/sandbox2/forkserver.pb.h"
 #include "sandboxed_api/sandbox2/global_forkclient.h"
 #include "sandboxed_api/sandbox2/ipc.h"
+#include "sandboxed_api/sandbox2/namespace.h"
 #include "sandboxed_api/sandbox2/util.h"
 #include "sandboxed_api/util/fileops.h"
-#include "sandboxed_api/util/raw_logging.h"
 
 namespace sandbox2 {
 
@@ -85,9 +85,9 @@ std::vector<std::string> Executor::CopyEnviron() {
   return util::CharPtrArray(environ).ToStringVector();
 }
 
-absl::StatusOr<SandboxeeProcess> Executor::StartSubProcess(int32_t clone_flags,
-                                                           const Namespace* ns,
-                                                           MonitorType type) {
+absl::StatusOr<SandboxeeProcess> Executor::StartSubProcess(
+    int32_t clone_flags, const Namespace* ns, bool allow_speculation,
+    MonitorType type) {
   if (started_) {
     return absl::FailedPreconditionError(
         "This executor has already been started");
@@ -96,9 +96,6 @@ absl::StatusOr<SandboxeeProcess> Executor::StartSubProcess(int32_t clone_flags,
   if (!path_.empty()) {
     exec_fd_ = file_util::fileops::FDCloser(open(path_.c_str(), O_PATH));
     if (exec_fd_.get() < 0) {
-      if (errno == ENOENT) {
-        return absl::ErrnoToStatus(errno, path_);
-      }
       return absl::ErrnoToStatus(errno,
                                  absl::StrCat("Could not open file ", path_));
     }
@@ -145,6 +142,7 @@ absl::StatusOr<SandboxeeProcess> Executor::StartSubProcess(int32_t clone_flags,
 
   if (ns) {
     clone_flags |= ns->clone_flags();
+    request.set_netns_mode(ns->netns_config());
     *request.mutable_mount_tree() = ns->mounts().GetMountTree();
     request.set_hostname(ns->hostname());
     request.set_allow_mount_propagation(ns->allow_mount_propagation());
@@ -152,6 +150,7 @@ absl::StatusOr<SandboxeeProcess> Executor::StartSubProcess(int32_t clone_flags,
 
   request.set_clone_flags(clone_flags);
   request.set_monitor_type(type);
+  request.set_allow_speculation(allow_speculation);
 
   SandboxeeProcess process;
 

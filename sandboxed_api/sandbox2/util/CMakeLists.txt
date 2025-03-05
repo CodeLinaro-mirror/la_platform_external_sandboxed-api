@@ -61,6 +61,46 @@ target_link_libraries(sandbox2_util_syscall_trap
           sapi::config
 )
 
+# sandboxed_api/sandbox2/util:pid_waiter
+add_library(sandbox2_util_pid_waiter ${SAPI_LIB_TYPE}
+  pid_waiter.cc
+  pid_waiter.h
+)
+add_library(sandbox2::pid_waiter ALIAS sandbox2_util_pid_waiter)
+target_link_libraries(sandbox2_util_pid_waiter
+  PUBLIC absl::core_headers
+         absl::cleanup
+         absl::synchronization
+         absl::time
+         sandbox2::deadline_manager
+  PRIVATE sapi::base
+)
+
+
+# sandboxed_api/sandbox2/util:deadline_manager
+add_library(sandbox2_util_deadline_manager ${SAPI_LIB_TYPE}
+  deadline_manager.cc
+  deadline_manager.h
+)
+add_library(sandbox2::deadline_manager ALIAS sandbox2_util_deadline_manager)
+target_link_libraries(sandbox2_util_deadline_manager
+  PUBLIC absl::btree
+         absl::core_headers
+         absl::flags
+         absl::function_ref
+         absl::no_destructor
+         absl::strings
+         absl::synchronization
+         absl::time
+         sapi::thread
+  PRIVATE absl::base
+          absl::check
+          absl::log
+          absl::strings
+          sandbox2::util
+          sapi::base
+)
+
 if(BUILD_TESTING AND SAPI_BUILD_TESTING)
   # sandboxed_api/sandbox2/util:minielf_test
   add_executable(sandbox2_minielf_test
@@ -103,4 +143,49 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
     sapi::test_main
   )
   gtest_discover_tests_xcompile(sandbox2_maps_parser_test)
+
+  # sandboxed_api/sandbox2/util:bpf_helper_test
+  add_executable(sandbox2_bpf_helper_test
+    bpf_helper_test.cc
+  )
+  set_target_properties(sandbox2_bpf_helper_test PROPERTIES
+    OUTPUT_NAME bpf_helper_test
+  )
+  target_link_libraries(sandbox2_bpf_helper_test PRIVATE
+    absl::strings
+    sandbox2::bpf_helper
+    sapi::test_main
+  )
+  gtest_discover_tests_xcompile(sandbox2_bpf_helper_test)
+
+  # sandboxed_api/sandbox2/util:pid_waiter_test
+  add_executable(sandbox2_pid_waiter_test
+    pid_waiter_test.cc
+  )
+  set_target_properties(sandbox2_pid_waiter_test PROPERTIES
+    OUTPUT_NAME pid_waiter_test
+  )
+  target_link_libraries(sandbox2_pid_waiter_test PRIVATE
+    absl::time
+    sandbox2::pid_waiter
+    sapi::test_main
+    sapi::thread
+  )
+
+  # sandboxed_api/sandbox2/util:deadline_manager_test
+  add_executable(sandbox2_deadline_manager_test
+    deadline_manager_test.cc
+  )
+  set_target_properties(sandbox2_deadline_manager_test PROPERTIES
+    OUTPUT_NAME deadline_manager_test
+  )
+  target_link_libraries(sandbox2_deadline_manager_test PRIVATE
+    absl::check
+    absl::flags
+    absl::time
+    sandbox2::deadline_manager
+    sapi::test_main
+    sapi::thread
+  )
+  gtest_discover_tests_xcompile(sandbox2_deadline_manager_test)
 endif()

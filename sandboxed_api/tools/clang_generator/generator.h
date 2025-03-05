@@ -29,8 +29,12 @@
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Serialization/PCHContainerOperations.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Config/llvm-config.h"
 #include "sandboxed_api/tools/clang_generator/emitter.h"
+#include "sandboxed_api/tools/clang_generator/emitter_base.h"
 #include "sandboxed_api/tools/clang_generator/types.h"
 
 namespace sapi {
@@ -95,7 +99,7 @@ class GeneratorASTVisitor
 
 class GeneratorASTConsumer : public clang::ASTConsumer {
  public:
-  GeneratorASTConsumer(std::string in_file, Emitter& emitter,
+  GeneratorASTConsumer(std::string in_file, EmitterBase& emitter,
                        const GeneratorOptions& options)
       : in_file_(std::move(in_file)), visitor_(options), emitter_(emitter) {}
 
@@ -104,12 +108,12 @@ class GeneratorASTConsumer : public clang::ASTConsumer {
 
   std::string in_file_;
   GeneratorASTVisitor visitor_;
-  Emitter& emitter_;
+  EmitterBase& emitter_;
 };
 
 class GeneratorAction : public clang::ASTFrontendAction {
  public:
-  GeneratorAction(Emitter& emitter, const GeneratorOptions& options)
+  GeneratorAction(EmitterBase& emitter, const GeneratorOptions& options)
       : emitter_(emitter), options_(options) {}
 
  private:
@@ -126,14 +130,14 @@ class GeneratorAction : public clang::ASTFrontendAction {
 
   bool hasCodeCompletionSupport() const override { return false; }
 
-  Emitter& emitter_;
+  EmitterBase& emitter_;
   const GeneratorOptions& options_;
 };
 
 class GeneratorFactory : public clang::tooling::FrontendActionFactory {
  public:
   // Does not take ownership
-  GeneratorFactory(Emitter& emitter, const GeneratorOptions& options)
+  GeneratorFactory(EmitterBase& emitter, const GeneratorOptions& options)
       : emitter_(emitter), options_(options) {}
 
  private:
@@ -153,10 +157,11 @@ class GeneratorFactory : public clang::tooling::FrontendActionFactory {
       std::shared_ptr<clang::PCHContainerOperations> pch_container_ops,
       clang::DiagnosticConsumer* diag_consumer) override;
 
-  Emitter& emitter_;
+  EmitterBase& emitter_;
   const GeneratorOptions& options_;
 };
 
+// Returns the output filename for the given source file ending in .sapi.h.
 std::string GetOutputFilename(absl::string_view source_file);
 
 inline absl::string_view ToStringView(llvm::StringRef ref) {
