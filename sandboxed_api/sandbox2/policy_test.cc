@@ -43,9 +43,9 @@ using ::sapi::GetTestSourcePath;
 using ::testing::Eq;
 
 #ifdef SAPI_X86_64
+
 // Test that 32-bit syscalls from 64-bit are disallowed.
 TEST(PolicyTest, AMD64Syscall32PolicyAllowed) {
-  SKIP_ANDROID;
   const std::string path = GetTestSourcePath("sandbox2/testcases/policy");
 
   std::vector<std::string> args = {path, "1"};
@@ -62,7 +62,6 @@ TEST(PolicyTest, AMD64Syscall32PolicyAllowed) {
 
 // Test that 32-bit syscalls from 64-bit for FS checks are disallowed.
 TEST(PolicyTest, AMD64Syscall32FsAllowed) {
-  SKIP_ANDROID;
   const std::string path = GetTestSourcePath("sandbox2/testcases/policy");
   std::vector<std::string> args = {path, "2"};
 
@@ -138,9 +137,6 @@ TEST(PolicyTest, BpfPtracePermissionDenied) {
 TEST(PolicyTest, IsattyAllowed) {
   SKIP_SANITIZERS;
   PolicyBuilder builder;
-  if constexpr (sapi::host_os::IsAndroid()) {
-    builder.DisableNamespaces().AllowDynamicStartup();
-  }
   builder.AllowStaticStartup()
       .AllowExit()
       .AllowRead()
@@ -156,14 +152,81 @@ TEST(PolicyTest, IsattyAllowed) {
   ASSERT_THAT(result.final_status(), Eq(Result::OK));
 }
 
+PolicyBuilder PosixTimersPolicyBuilder(absl::string_view path) {
+  return PolicyBuilder()
+      // Required by google infra / logging.
+      .AllowDynamicStartup()
+      .AllowWrite()
+      .AllowSyscall(__NR_getcwd)
+      .AllowMmap()
+      .AllowMlock()
+      .AllowMkdir()
+      .AllowGetIDs()
+      .AllowExit()
+      .AllowRestartableSequences(PolicyBuilder::kAllowSlowFences)
+      .AllowSyscall(__NR_rt_sigtimedwait)
+      // Features used by the binary.
+      .AllowHandleSignals()
+      .AllowGetPIDs()
+      .AllowTime()
+      .AllowSleep()
+      .AllowAlarm()
+      // Posix timers themselves.
+      .AllowPosixTimers();
+}
+
+TEST(PolicyTest, PosixTimersWorkIfAllowed) {
+  SKIP_SANITIZERS;
+  const std::string path = GetTestSourcePath("sandbox2/testcases/posix_timers");
+  for (absl::string_view kind : {"SIGEV_NONE", "SIGEV_SIGNAL",
+                                 "SIGEV_THREAD_ID", "syscall(SIGEV_THREAD)"}) {
+    std::vector<std::string> args = {path, "--sigev_notify_kind",
+                                     std::string(kind)};
+
+    SAPI_ASSERT_OK_AND_ASSIGN(auto policy,
+                              PosixTimersPolicyBuilder(path).TryBuild());
+    auto executor = std::make_unique<Executor>(path, args);
+    Sandbox2 sandbox(std::move(executor), std::move(policy));
+    Result result = sandbox.Run();
+    EXPECT_EQ(result.final_status(), Result::OK) << kind;
+  }
+}
+
+TEST(PolicyTest, PosixTimersCannotCreateThreadsIfThreadsAreProhibited) {
+  SKIP_SANITIZERS;
+  const std::string path = GetTestSourcePath("sandbox2/testcases/posix_timers");
+  std::vector<std::string> args = {
+      path,
+      // SIGEV_THREAD creates a thread as an implementation detail.
+      "--sigev_notify_kind=SIGEV_THREAD",
+  };
+
+  SAPI_ASSERT_OK_AND_ASSIGN(auto policy,
+                            PosixTimersPolicyBuilder(path).TryBuild());
+  auto executor = std::make_unique<Executor>(path, args);
+  Sandbox2 sandbox(std::move(executor), std::move(policy));
+  Result result = sandbox.Run();
+  EXPECT_EQ(result.final_status(), Result::VIOLATION);
+}
+
+TEST(PolicyTest, PosixTimersCanCreateThreadsIfThreadsAreAllowed) {
+  SKIP_SANITIZERS;
+  const std::string path = GetTestSourcePath("sandbox2/testcases/posix_timers");
+  std::vector<std::string> args = {path, "--sigev_notify_kind=SIGEV_THREAD"};
+
+  SAPI_ASSERT_OK_AND_ASSIGN(auto policy, PosixTimersPolicyBuilder(path)
+                                             .AllowFork()
+                                             // For Arm.
+                                             .AllowSyscall(__NR_madvise)
+                                             .TryBuild());
+  auto executor = std::make_unique<Executor>(path, args);
+  Sandbox2 sandbox(std::move(executor), std::move(policy));
+  Result result = sandbox.Run();
+  EXPECT_EQ(result.final_status(), Result::OK);
+}
+
 std::unique_ptr<Policy> MinimalTestcasePolicy(absl::string_view path = "") {
   PolicyBuilder builder;
-
-  if constexpr (sapi::host_os::IsAndroid()) {
-    builder.AllowDynamicStartup();
-    builder.DisableNamespaces();
-  }
-
   builder.AllowStaticStartup().AllowExit().AllowLlvmCoverage();
   return builder.BuildOrDie();
 }
@@ -172,7 +235,6 @@ std::unique_ptr<Policy> MinimalTestcasePolicy(absl::string_view path = "") {
 // If this starts failing, it means something changed, maybe in the way we
 // compile static binaries, and we need to update the policy just above.
 TEST(MinimalTest, MinimalBinaryWorks) {
-  SKIP_ANDROID;
   SKIP_SANITIZERS;
   const std::string path = GetTestSourcePath("sandbox2/testcases/minimal");
   std::vector<std::string> args = {path};
@@ -192,14 +254,10 @@ TEST(MinimalTest, MinimalSharedBinaryWorks) {
   std::vector<std::string> args = {path};
 
   PolicyBuilder builder;
-
-  if constexpr (sapi::host_os::IsAndroid()) {
-    builder.DisableNamespaces();
-  } else {
-    builder.AddLibrariesForBinary(path);
-  }
-
-  builder.AllowDynamicStartup().AllowExit().AllowLlvmCoverage();
+  builder.AddLibrariesForBinary(path)
+      .AllowDynamicStartup()
+      .AllowExit()
+      .AllowLlvmCoverage();
   auto policy = builder.BuildOrDie();
 
   Sandbox2 s2(std::make_unique<Executor>(path, args), std::move(policy));
@@ -217,15 +275,6 @@ TEST(MallocTest, SystemMallocWorks) {
   std::vector<std::string> args = {path};
 
   PolicyBuilder builder;
-
-  if constexpr (sapi::host_os::IsAndroid()) {
-    builder.DisableNamespaces();
-    builder.AllowDynamicStartup();
-    builder.AllowSyscalls({
-        __NR_madvise,
-    });
-  }
-
   builder.AllowStaticStartup()
       .AllowSystemMalloc()
       .AllowExit()
@@ -251,11 +300,6 @@ TEST(MultipleSyscalls, AddPolicyOnSyscallsWorks) {
   std::vector<std::string> args = {path};
 
   PolicyBuilder builder;
-  if constexpr (sapi::host_os::IsAndroid()) {
-    builder.DisableNamespaces();
-    builder.AllowDynamicStartup();
-  }
-
   builder.AllowStaticStartup()
       .AllowTcMalloc()
       .AllowExit()
@@ -300,6 +344,24 @@ TEST(MultipleSyscalls, AddPolicyOnSyscallsWorks) {
 
   ASSERT_THAT(result.final_status(), Eq(Result::VIOLATION));
   EXPECT_THAT(result.reason_code(), Eq(__NR_umask));
+}
+
+// Test that util::kMagicSyscallNo is returns ENOSYS or util::kMagicSyscallErr.
+TEST(PolicyTest, DetectSandboxSyscall) {
+  const std::string path =
+      GetTestSourcePath("sandbox2/testcases/sandbox_detection");
+  std::vector<std::string> args = {path};
+
+  SAPI_ASSERT_OK_AND_ASSIGN(auto policy,
+                            CreateDefaultPermissiveTestPolicy(path).TryBuild());
+  auto executor = std::make_unique<Executor>(path, args);
+  executor->set_enable_sandbox_before_exec(false);
+  Sandbox2 s2(std::move(executor), std::move(policy));
+  auto result = s2.Run();
+
+  // The test binary should exit with success.
+  ASSERT_THAT(result.final_status(), Eq(Result::OK));
+  EXPECT_THAT(result.reason_code(), Eq(0));
 }
 
 }  // namespace
