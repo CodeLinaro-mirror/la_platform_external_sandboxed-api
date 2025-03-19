@@ -12,20 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"
+#include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "clang/Tooling/Tooling.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 #include "sandboxed_api/tools/clang_generator/compilation_database.h"
+#include "sandboxed_api/tools/clang_generator/emitter.h"
 #include "sandboxed_api/tools/clang_generator/generator.h"
 #include "sandboxed_api/util/file_helpers.h"
 #include "sandboxed_api/util/fileops.h"
@@ -35,53 +38,63 @@
 namespace sapi {
 namespace {
 
-static auto* g_tool_category =
-    new llvm::cl::OptionCategory("Sandboxed API Options");
+absl::NoDestructor<llvm::cl::OptionCategory> g_tool_category(
+    "Sandboxed API Options");
 
-static auto* g_common_help =
-    new llvm::cl::extrahelp(clang::tooling::CommonOptionsParser::HelpMessage);
-static auto* g_extra_help = new llvm::cl::extrahelp(
+absl::NoDestructor<llvm::cl::extrahelp> g_common_help(
+    clang::tooling::CommonOptionsParser::HelpMessage);
+absl::NoDestructor<llvm::cl::extrahelp> g_extra_help(
     "Full documentation at: "
-    "<https://developers.google.com/code-sandboxing/sandboxed-api/>\n"
+    "<https://developers.google.com/code-sandboxing/sandboxed-api>\n"
     "Report bugs to <https://github.com/google/sandboxed-api/issues>\n");
 
 // Command line options
-static auto* g_sapi_embed_dir = new llvm::cl::opt<std::string>(
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_embed_dir(
     "sapi_embed_dir", llvm::cl::desc("Directory with embedded includes"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_embed_name = new llvm::cl::opt<std::string>(
+
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_embed_name(
     "sapi_embed_name", llvm::cl::desc("Identifier of the embed object"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_functions = new llvm::cl::list<std::string>(
+
+absl::NoDestructor<llvm::cl::list<std::string>> g_sapi_functions(
     "sapi_functions", llvm::cl::CommaSeparated,
     llvm::cl::desc("List of functions to generate a Sandboxed API for. If "
                    "empty, generates a SAPI for all functions found."),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_in = new llvm::cl::list<std::string>(
+
+ABSL_DEPRECATED("Pass the input files directly to the tool.")
+absl::NoDestructor<llvm::cl::list<std::string>> g_sapi_in(
     "sapi_in", llvm::cl::CommaSeparated,
-    llvm::cl::desc("List of input files to analyze (deprecated)"),
+    llvm::cl::desc("List of input files to analyze (DEPRECATED)"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_isystem = new llvm::cl::opt<std::string>(
+
+ABSL_DEPRECATED("Ignored for compatibility.")
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_isystem(
     "sapi_isystem",
-    llvm::cl::desc("Parameter file with extra system include paths (ignored "
-                   "for compatibility)"),
-    llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_limit_scan_depth = new llvm::cl::opt<bool>(
-    "sapi_limit_scan_depth",
     llvm::cl::desc(
-        "Whether to only scan for functions in the top-most translation unit"),
+        "Parameter file with extra system include paths (DEPRECATED)"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_name = new llvm::cl::opt<std::string>(
+
+absl::NoDestructor<llvm::cl::opt<bool>> g_sapi_limit_scan_depth(
+    "sapi_limit_scan_depth",
+    llvm::cl::desc("Whether to only scan for functions "
+                   "in the top-most translation unit"),
+    llvm::cl::cat(*g_tool_category));
+
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_name(
     "sapi_name", llvm::cl::desc("Name of the Sandboxed API library"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_ns = new llvm::cl::opt<std::string>(
+
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_ns(
     "sapi_ns", llvm::cl::desc("C++ namespace to wrap Sandboxed API class in"),
     llvm::cl::cat(*g_tool_category));
-static auto* g_sapi_out = new llvm::cl::opt<std::string>(
+
+absl::NoDestructor<llvm::cl::opt<std::string>> g_sapi_out(
     "sapi_out",
-    llvm::cl::desc(
-        "Output path of the generated header. If empty, simply appends .sapi.h "
-        "to the basename of the first source file specified."),
+    llvm::cl::desc("Output path of the generated header. If empty, simply "
+                   "appends .sapi.h "
+                   "to the basename of the first source file specified."),
     llvm::cl::cat(*g_tool_category));
 
 }  // namespace
@@ -89,14 +102,13 @@ static auto* g_sapi_out = new llvm::cl::opt<std::string>(
 GeneratorOptions GeneratorOptionsFromFlags(
     const std::vector<std::string>& sources) {
   GeneratorOptions options;
-  options.work_dir = sapi::file_util::fileops::GetCWD();
+  options.work_dir = file_util::fileops::GetCWD();
   options.set_function_names(*g_sapi_functions);
   for (const auto& input : sources) {
     // Keep absolute paths as is, turn
-    options.in_files.insert(
-        absl::StartsWith(input, "/")
-            ? input
-            : sapi::file::JoinPath(options.work_dir, input));
+    options.in_files.insert(absl::StartsWith(input, "/")
+                                ? input
+                                : file::JoinPath(options.work_dir, input));
   }
   options.set_limit_scan_depth(*g_sapi_limit_scan_depth);
   options.name = *g_sapi_name;
@@ -110,7 +122,7 @@ GeneratorOptions GeneratorOptionsFromFlags(
 
 absl::Status GeneratorMain(int argc, char* argv[]) {
   auto expected_opt_parser = OptionsParser::create(
-      argc, const_cast<const char**>(argv), *sapi::g_tool_category,
+      argc, const_cast<const char**>(argv), *g_tool_category,
       llvm::cl::ZeroOrMore,
       "Generates a Sandboxed API header for C/C++ translation units.");
   if (!expected_opt_parser) {
@@ -119,37 +131,37 @@ absl::Status GeneratorMain(int argc, char* argv[]) {
   OptionsParser& opt_parser = expected_opt_parser.get();
 
   std::vector<std::string> sources = opt_parser.getSourcePathList();
-  for (const auto& sapi_in : *sapi::g_sapi_in) {
+  for (const auto& sapi_in : *g_sapi_in) {  // NOLINT
     sources.push_back(sapi_in);
   }
   if (sources.empty()) {
-    return absl::InvalidArgumentError("error: no input files");
+    return absl::InvalidArgumentError("Error: No input files.");
   }
 
-  auto options = sapi::GeneratorOptionsFromFlags(sources);
-  sapi::Emitter emitter;
+  auto options = GeneratorOptionsFromFlags(sources);
 
   std::unique_ptr<clang::tooling::CompilationDatabase> db =
       FromCxxAjustedCompileCommands(
           NonOwningCompileCommands(opt_parser.getCompilations()));
   clang::tooling::ClangTool tool(*db, sources);
 
-  if (!g_sapi_isystem->empty()) {
+  if (!g_sapi_isystem->empty()) {  // NOLINT(deprecated)
     absl::FPrintF(
         stderr,
-        "note: ignoring deprecated command-line option: sapi_isystem\n");
+        "Note: Ignoring deprecated command-line option: sapi_isystem\n");
   }
 
-  if (int result = tool.run(
-          std::make_unique<sapi::GeneratorFactory>(emitter, options).get());
+  // Process SAPI header generation.
+  Emitter emitter;
+  if (int result =
+          tool.run(std::make_unique<GeneratorFactory>(emitter, options).get());
       result != 0) {
-    return absl::UnknownError("header generation failed");
+    return absl::UnknownError("Error: Header generation failed.");
   }
 
   SAPI_ASSIGN_OR_RETURN(std::string header, emitter.EmitHeader(options));
-
-  SAPI_RETURN_IF_ERROR(sapi::file::SetContents(options.out_file, header,
-                                               sapi::file::Defaults()));
+  SAPI_RETURN_IF_ERROR(
+      file::SetContents(options.out_file, header, file::Defaults()));
   return absl::OkStatus();
 }
 

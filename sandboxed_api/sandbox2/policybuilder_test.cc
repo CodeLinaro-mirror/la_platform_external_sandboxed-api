@@ -18,18 +18,22 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "sandboxed_api/sandbox2/allowlists/unrestricted_networking.h"
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/util/bpf_helper.h"
-#include "sandboxed_api/sandbox2/violation.pb.h"
+#include "sandboxed_api/util/fileops.h"
+#include "sandboxed_api/util/path.h"
 #include "sandboxed_api/util/status_matchers.h"
 
 namespace sandbox2 {
@@ -40,16 +44,13 @@ class PolicyBuilderPeer {
 
   int policy_size() const { return builder_->user_policy_.size(); }
 
-  static absl::StatusOr<std::string> ValidateAbsolutePath(
-      absl::string_view path) {
-    return PolicyBuilder::ValidateAbsolutePath(path);
-  }
-
  private:
   PolicyBuilder* builder_;
 };
 
 namespace {
+
+namespace fileops = ::sapi::file_util::fileops;
 
 using ::sapi::IsOk;
 using ::sapi::StatusIs;
@@ -89,8 +90,8 @@ TEST(PolicyBuilderTest, Testpolicy_size) {
   assert_increased();
 
   builder.AllowTCGETS(); assert_increased();
-  builder.AllowTCGETS(); assert_increased();
-  builder.AllowTCGETS(); assert_increased();
+  builder.AllowTCGETS(); assert_same();
+  builder.AllowTCGETS(); assert_same();
 
   builder.AddPolicyOnSyscall(__NR_fchmod, { ALLOW }); assert_increased();
   builder.AddPolicyOnSyscall(__NR_fchmod, { ALLOW }); assert_increased();
@@ -108,31 +109,114 @@ TEST(PolicyBuilderTest, Testpolicy_size) {
   builder.AddFile("/usr/bin/find"); assert_same();
   builder.AddDirectory("/bin"); assert_same();
   builder.AddTmpfs("/tmp", /*size=*/4ULL << 20 /* 4 MiB */); assert_same();
-  builder.AllowUnrestrictedNetworking(); assert_same();
+  builder.UseForkServerSharedNetNs(); assert_same();
+  builder.Allow(UnrestrictedNetworking()); assert_same();
   // clang-format on
 }
 
-TEST(PolicyBuilderTest, TestValidateAbsolutePath) {
-  for (auto const& bad_path : {
-           "..",
-           "a",
-           "a/b",
-           "a/b/c",
-           "/a/b/c/../d",
-           "/a/b/c/./d",
-           "/a/b/c//d",
-           "/a/b/c/d/",
-           "/a/bAAAAAAAAAAAAAAAAAAAAAA/c/d/",
-       }) {
-    EXPECT_THAT(PolicyBuilderPeer::ValidateAbsolutePath(bad_path),
-                StatusIs(absl::StatusCode::kInvalidArgument));
+TEST(PolicyBuilderTest, ApisWithPathValidation) {
+  const std::initializer_list<std::pair<absl::string_view, absl::StatusCode>>
+      kTestCases = {
+          {"/a", absl::StatusCode::kOk},
+          {"/a/b/c/d", absl::StatusCode::kOk},
+          {"/a/b/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", absl::StatusCode::kOk},
+          {"", absl::StatusCode::kInvalidArgument},
+          // Fails because we reject paths starting with '..'
+          {"..", absl::StatusCode::kInvalidArgument},
+          {"..a", absl::StatusCode::kInvalidArgument},
+          {"../a", absl::StatusCode::kInvalidArgument},
+          // Fails because is not absolute
+          {"a", absl::StatusCode::kInvalidArgument},
+          {"a/b", absl::StatusCode::kInvalidArgument},
+          {"a/b/c", absl::StatusCode::kInvalidArgument},
+          // Fails because '..' in path
+          {"/a/b/c/../d", absl::StatusCode::kInvalidArgument},
+          // Fails because '.' in path
+          {"/a/b/c/./d", absl::StatusCode::kInvalidArgument},
+          // Fails because '//' in path
+          {"/a/b/c//d", absl::StatusCode::kInvalidArgument},
+          // Fails because path ends with '/'
+          {"/a/b/c/d/", absl::StatusCode::kInvalidArgument},
+      };
+  for (auto const& [path, status] : kTestCases) {
+    EXPECT_THAT(PolicyBuilder().AddFile(path).TryBuild(), StatusIs(status));
+    EXPECT_THAT(PolicyBuilder().AddFileAt(path, "/input").TryBuild(),
+                StatusIs(status));
+    EXPECT_THAT(PolicyBuilder().AddDirectory(path).TryBuild(),
+                StatusIs(status));
+    EXPECT_THAT(PolicyBuilder().AddDirectoryAt(path, "/input").TryBuild(),
+                StatusIs(status));
   }
 
-  for (auto const& good_path :
-       {"/", "/a/b/c/d", "/a/b/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}) {
-    SAPI_ASSERT_OK_AND_ASSIGN(
-        std::string path, PolicyBuilderPeer::ValidateAbsolutePath(good_path));
-    EXPECT_THAT(path, StrEq(good_path));
+  // Fails because it attempts to mount to '/' inside
+  EXPECT_THAT(PolicyBuilder().AddFile("/").TryBuild(),
+              StatusIs(absl::StatusCode::kInternal));
+  EXPECT_THAT(PolicyBuilder().AddDirectory("/").TryBuild(),
+              StatusIs(absl::StatusCode::kInternal));
+
+  // Succeeds because it attempts to mount to '/' inside
+  EXPECT_THAT(PolicyBuilder().AddFileAt("/a", "/input").TryBuild(), IsOk());
+  EXPECT_THAT(PolicyBuilder().AddDirectoryAt("/a", "/input").TryBuild(),
+              IsOk());
+}
+
+TEST(PolicyBuilderTest, TestAnchorPathAbsolute) {
+  const std::initializer_list<
+      std::tuple<absl::string_view, absl::string_view, std::string>>
+      kTestCases = {
+          // relative_path is empty:
+          {"", "/base", ""},  // Error: relative path is empty
+          {"", "", ""},       // Error: relative path is empty
+
+          // relative_path is absolute:
+          {"/a/b/c/d", "/base", "/a/b/c/d"},
+          {"/a/../../../../../etc/passwd", "/base",
+           "/a/../../../../../etc/passwd"},
+          {"/a/b/c/d", "base", "/a/b/c/d"},
+          {"/a/b/c/d", "", "/a/b/c/d"},
+
+          // base is absolute:
+          {"a/b/c/d", "/base", "/base/a/b/c/d"},
+          {"a/b/c/d/", "/base", "/base/a/b/c/d"},
+          {"a/b/c//d", "/base", "/base/a/b/c/d"},
+          {"a/b/../d/", "/base", "/base/a/d"},
+          {"a/./b/c/", "/base", "/base/a/b/c"},
+          {"./a/b/c/", "/base", "/base/a/b/c"},
+          {"..foobar", "/base", "/base/..foobar"},
+          {"a/b/c/d", "/base/../foo/bar",
+           "/foo/bar/a/b/c/d"},         // Not an error because base is trusted.
+          {"a/../../d/", "/base", ""},  // Error: can't guarantee anchor
+          {"../a/b/c/", "/base", ""},   // Error: can't guarantee anchor
+          {"..", "/base", ""},          // Error: can't guarantee anchor
+
+          // base path is empty:
+          {"a/b/c", "", fileops::GetCWD() + "/a/b/c"},
+          {"a/../../../../c", "", ""},  // Error: can't guarantee anchor
+
+          // base is relative:
+          {"a/b/c/d", "base", fileops::GetCWD() + "/base/a/b/c/d"},
+          {"a/b/c/d/", "base", fileops::GetCWD() + "/base/a/b/c/d"},
+          {"a/b/c//d", "base", fileops::GetCWD() + "/base/a/b/c/d"},
+          {"a/b/../d/", "base", fileops::GetCWD() + "/base/a/d"},
+          {"a/./b/c/", "base", fileops::GetCWD() + "/base/a/b/c"},
+          {"./a/b/c/", "base", fileops::GetCWD() + "/base/a/b/c"},
+          {"..foobar", "base", fileops::GetCWD() + "/base/..foobar"},
+          {"a/../../d/", "base", ""},  // Error: can't guarantee anchor
+          {"../a/b/c/", "base", ""},   // Error: can't guarantee anchor
+          {"..", "base", ""},          // Error: can't guarantee anchor
+          {"a/b/c", ".base/foo/", fileops::GetCWD() + "/.base/foo/a/b/c"},
+          {"a/b/c", "./base/foo", fileops::GetCWD() + "/base/foo/a/b/c"},
+          {"a/b/c", "base/foo/../bar", fileops::GetCWD() + "/base/bar/a/b/c"},
+          {"a/b/c", "base/foo//bar/",
+           fileops::GetCWD() + "/base/foo/bar/a/b/c"},
+          {"a/b/c", "..base/foo", fileops::GetCWD() + "/..base/foo/a/b/c"},
+          {"a/b/c", "../base/foo",
+           sapi::file::CleanPath(fileops::GetCWD() + "/../base/foo/a/b/c")},
+          {"a/b/c", "..",
+           sapi::file::CleanPath(fileops::GetCWD() + "/../a/b/c")},
+      };
+  for (auto const& [path, base, result] : kTestCases) {
+    EXPECT_THAT(PolicyBuilder::AnchorPathAbsolute(path, base), StrEq(result));
   }
 }
 
@@ -156,7 +240,20 @@ TEST(PolicyBuilderTest, TestIsCopyable) {
   EXPECT_THAT(copy.TryBuild(), IsOk());
 }
 
-TEST(PolicyBuilderTest, CanBypassPtrace) {
+TEST(PolicyBuilderTest, CannotBypassBpf) {
+  PolicyBuilder builder;
+  builder.AddPolicyOnSyscall(__NR_bpf, {ALLOW})
+      .BlockSyscallWithErrno(__NR_bpf, ENOENT);
+  EXPECT_THAT(builder.TryBuild(), Not(IsOk()));
+}
+
+TEST(PolicyBuilderTest, CannotBypassAfterAllowSafeBpf) {
+  PolicyBuilder builder;
+  builder.AllowSafeBpf().AddPolicyOnSyscall(__NR_bpf, {ALLOW});
+  EXPECT_THAT(builder.TryBuild(), Not(IsOk()));
+}
+
+TEST(PolicyBuilderTest, CannotBypassPtrace) {
   PolicyBuilder builder;
   builder.AddPolicyOnSyscall(__NR_ptrace, {ALLOW})
       .BlockSyscallWithErrno(__NR_ptrace, ENOENT);
@@ -174,6 +271,24 @@ TEST(PolicyBuilderTest, AddPolicyOnSyscallJumpOutOfBounds) {
   builder.AddPolicyOnSyscall(__NR_write,
                              {BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 1, 2, 0)});
   EXPECT_THAT(builder.TryBuild(), StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(PolicyBuilderTest, TestAllowLlvmCoverage) {
+  ASSERT_THAT(setenv("COVERAGE", "1", 0), Eq(0));
+  ASSERT_THAT(setenv("COVERAGE_DIR", "/tmp", 0), Eq(0));
+  PolicyBuilder builder;
+  builder.AllowLlvmCoverage();
+  EXPECT_THAT(builder.TryBuild(), IsOk());
+  ASSERT_THAT(unsetenv("COVERAGE"), Eq(0));
+  ASSERT_THAT(unsetenv("COVERAGE_DIR"), Eq(0));
+}
+
+TEST(PolicyBuilderTest, TestAllowLlvmCoverageWithoutCoverageDir) {
+  ASSERT_THAT(setenv("COVERAGE", "1", 0), Eq(0));
+  PolicyBuilder builder;
+  builder.AllowLlvmCoverage();
+  EXPECT_THAT(builder.TryBuild(), IsOk());
+  ASSERT_THAT(unsetenv("COVERAGE"), Eq(0));
 }
 }  // namespace
 }  // namespace sandbox2

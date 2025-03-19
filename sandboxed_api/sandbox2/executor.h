@@ -40,6 +40,7 @@ namespace sandbox2 {
 // The sandbox2::Executor class is responsible for both creating and executing
 // new processes which will be sandboxed.
 class Executor final {
+
  public:
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -126,6 +127,7 @@ class Executor final {
   // For clone_flags refer to Linux' 'man 2 clone'.
   absl::StatusOr<SandboxeeProcess> StartSubProcess(
       int clone_flags, const Namespace* ns = nullptr,
+      bool allow_speculation = false,
       MonitorType type = FORKSERVER_MONITOR_PTRACE);
 
   // Whether the Executor has been started yet
