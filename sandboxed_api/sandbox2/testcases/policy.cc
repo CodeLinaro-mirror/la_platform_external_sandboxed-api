@@ -14,7 +14,9 @@
 
 // A binary that tries x86_64 compat syscalls, ptrace and clone untraced.
 
+#include <linux/prctl.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <syscall.h>
 #include <unistd.h>
@@ -99,7 +101,81 @@ void TestBpf() {
   exit(EXIT_FAILURE);
 }
 
+void TestSafeBpf() {
+#define BPF_MAP_LOOKUP_ELEM 1
+  // This call (if allowed) will return an error. We not interested in that
+  // here, we just want to check whether this call is allowed.
+  errno = 0;
+  syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, nullptr, 0);
+  if (errno == EPERM) {
+    printf("System call should not have been blocked\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
 void TestIsatty() { isatty(0); }
+
+#ifdef SAPI_X86_64
+void TestSpeculationAllowed() {
+  int res = prctl(PR_GET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS, 0, 0, 0);
+  if (res == -1) {
+    printf("prctl(R_GET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS) failed: %d\n",
+           errno);
+  } else if (res == PR_SPEC_NOT_AFFECTED) {
+    printf("CPU not affected for PR_SPEC_STORE_BYPASS");
+  } else if ((res & ~(PR_SPEC_PRCTL)) != PR_SPEC_ENABLE) {
+    printf(
+        "PR_SPEC_STORE_BYPASS speculation disabled when it should not have "
+        "been: %d\n",
+        res);
+    exit(EXIT_FAILURE);
+  }
+  res = prctl(PR_GET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH, 0, 0, 0);
+  if (res == -1) {
+    printf(
+        "prctl(R_GET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH) failed: %d\n",
+        errno);
+  } else if (res == PR_SPEC_NOT_AFFECTED) {
+    printf("CPU not affected for PR_SPEC_INDIRECT_BRANCH");
+  } else if ((res & ~(PR_SPEC_PRCTL)) != PR_SPEC_ENABLE) {
+    printf(
+        "PR_SPEC_INDIRECT_BRANCH speculation disabled when it should not have "
+        "been: %d\n",
+        res);
+    exit(EXIT_FAILURE);
+  }
+}
+
+void TestSpeculationBlocked() {
+  int res = prctl(PR_GET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS, 0, 0, 0);
+  if (res == -1) {
+    printf("prctl(R_GET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS) failed: %d\n",
+           errno);
+  } else if (res == PR_SPEC_NOT_AFFECTED) {
+    printf("CPU not affected for PR_SPEC_STORE_BYPASS");
+  } else if ((res & ~(PR_SPEC_PRCTL)) != PR_SPEC_FORCE_DISABLE) {
+    printf(
+        "PR_SPEC_STORE_BYPASS speculation enabled when it should not have "
+        "been: %d\n",
+        res);
+    exit(EXIT_FAILURE);
+  }
+  res = prctl(PR_GET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH, 0, 0, 0);
+  if (res == -1) {
+    printf(
+        "prctl(R_GET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH) failed: %d\n",
+        errno);
+  } else if (res == PR_SPEC_NOT_AFFECTED) {
+    printf("CPU not affected for PR_SPEC_INDIRECT_BRANCH");
+  } else if ((res & ~(PR_SPEC_PRCTL)) != PR_SPEC_FORCE_DISABLE) {
+    printf(
+        "PR_SPEC_INDIRECT_BRANCH speculation enabled when it should not have "
+        "been: %d\n",
+        res);
+    exit(EXIT_FAILURE);
+  }
+}
+#endif  // SAPI_X86_64
 
 int main(int argc, char* argv[]) {
   // Disable buffering.
@@ -140,6 +216,17 @@ int main(int argc, char* argv[]) {
     case 8:
       TestBpfBlocked();
       break;
+    case 9:
+      TestSafeBpf();
+      break;
+#ifdef SAPI_X86_64
+    case 11:
+      TestSpeculationAllowed();
+      break;
+    case 12:
+      TestSpeculationBlocked();
+      break;
+#endif  // SAPI_X86_64
     default:
       printf("Unknown test: %d\n", testno);
       return EXIT_FAILURE;

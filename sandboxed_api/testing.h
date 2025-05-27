@@ -17,6 +17,7 @@
 
 #include <string>
 
+#include "gtest/gtest.h"
 #include "absl/strings/string_view.h"
 #include "sandboxed_api/config.h"  // IWYU pragma: export
 #include "sandboxed_api/sandbox2/policybuilder.h"
@@ -45,21 +46,21 @@
 #define SKIP_SANITIZERS_AND_COVERAGE                          \
   do {                                                        \
     if (sapi::sanitizers::IsAny() || sapi::IsCoverageRun()) { \
-      return;                                                 \
+      GTEST_SKIP();                                           \
     }                                                         \
   } while (0)
 
 #define SKIP_SANITIZERS              \
   do {                               \
     if (sapi::sanitizers::IsAny()) { \
-      return;                        \
+      GTEST_SKIP();                  \
     }                                \
   } while (0)
 
 namespace sapi {
 
 sandbox2::PolicyBuilder CreateDefaultPermissiveTestPolicy(
-    absl::string_view bin_path);
+    absl::string_view binary_path);
 
 // Returns a writable path usable in tests. If the name argument is specified,
 // returns a name under that path. This can then be used for creating temporary

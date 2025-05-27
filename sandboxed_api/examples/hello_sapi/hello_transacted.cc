@@ -19,11 +19,10 @@
 #include <iostream>
 #include <memory>
 
-#include "absl/memory/memory.h"
 #include "absl/status/status.h"
-
 // Generated header
-#include "hello_sapi.sapi.h"  // NOLINT(build/include)
+#include "sandboxed_api/examples/hello_sapi/hello_sapi.sapi.h"
+#include "sandboxed_api/sandbox.h"
 #include "sandboxed_api/sandbox2/policy.h"
 #include "sandboxed_api/sandbox2/policybuilder.h"
 #include "sandboxed_api/transaction.h"

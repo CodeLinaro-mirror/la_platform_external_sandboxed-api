@@ -31,6 +31,11 @@
 namespace sapi {
 namespace internal {
 
+// Returns the contents of the file.
+std::string GetTestFileContents(absl::string_view file);
+
+// Sets up a virtual filesystem, adds code files to it, and runs a clang tool
+// on it.
 absl::Status RunClangTool(
     const std::vector<std::string>& command_line,
     const absl::flat_hash_map<std::string, std::string>& file_contents,
@@ -51,8 +56,18 @@ class FrontendActionTest : public ::testing::Test {
     input_file_ = std::string(value);
   }
 
+  // Returns the command line flags for the specified input file.
   virtual std::vector<std::string> GetCommandLineFlagsForTesting(
       absl::string_view input_file);
+
+  // Runs the specified frontend action on file loaded in-memory.
+  absl::Status RunFrontendActionOnFile(
+      absl::string_view input_file,
+      std::unique_ptr<clang::FrontendAction> action) {
+    set_input_file(input_file);
+    std::string code = internal::GetTestFileContents(input_file);
+    return RunFrontendAction(code, std::move(action));
+  }
 
   // Runs the specified frontend action on in-memory source code.
   absl::Status RunFrontendAction(
@@ -64,24 +79,15 @@ class FrontendActionTest : public ::testing::Test {
                                   std::move(action));
   }
 
-  // Runs the specified frontend action. Provided for compatibility with LLVM <
-  // 10. Takes ownership.
-  absl::Status RunFrontendAction(absl::string_view code,
-                                 clang::FrontendAction* action) {
-    return RunFrontendAction(code, absl::WrapUnique(action));
-  }
-
  private:
   std::string input_file_ = "input.cc";
   absl::flat_hash_map<std::string, std::string> file_contents_;
 };
 
-// Flattens a piece of C++ code into one line and removes consecutive runs of
-// whitespace. This makes it easier to compare code snippets for testing.
-// Note: This is not syntax-aware and will replace characters within strings as
-// well.
-std::string Uglify(absl::string_view code);
-
+// Flattens a vector of C++ code snippets into one line and removes consecutive
+// runs of whitespace. This makes it easier to compare code snippets for
+// testing. Note: This is not syntax-aware and will replace characters within
+// strings as well.
 std::vector<std::string> UglifyAll(const std::vector<std::string>& snippets);
 
 }  // namespace sapi

@@ -1,5 +1,8 @@
 name: generator-tool
-on: push
+on:
+  push:
+    branches:
+      - 'main'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -10,7 +13,7 @@ jobs:
     - name: Cache dependencies
       uses: actions/cache@v3
       with:
-        key: debian-10.13-clang16
+        key: debian-10.13-clang20
         path: |
           ${{github.workspace}}/build/_deps
 
@@ -33,7 +36,7 @@ jobs:
             wget
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
-        ./llvm.sh 16 all
+        ./llvm.sh 20 all
 
     - name: Configure CMake
       run: |
@@ -59,13 +62,15 @@ jobs:
         )
 
     - name: Upload Build Artifact
-      uses: actions/upload-artifact@v3.1.2
+      uses: actions/upload-artifact@v4
       with:
         name: sapi_generator_tool-linux
         path: ${{github.workspace}}/build/sapi_generator_tool-linux-x86_64
 
   prerelease:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     env:
       ARTIFACT_NAME: sapi_generator_tool-linux
@@ -84,7 +89,7 @@ jobs:
           let allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
             owner: context.repo.owner,
             repo: context.repo.repo,
-            run_id: context.payload.workflow_run.id,
+            run_id: ${{github.run_id}},
           });
           let matchArtifact = allArtifacts.data.artifacts.filter((artifact) => {
             return artifact.name == artifactName
@@ -97,7 +102,7 @@ jobs:
           });
           let fs = require('fs');
           fs.writeFileSync(
-            `${process.env.GITHUB_WORKSPACE}/build/${artifactName}.zip`,
+            `${{github.workspace}}/build/${artifactName}.zip`,
             Buffer.from(download.data)
           );
 
