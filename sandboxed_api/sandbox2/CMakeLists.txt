@@ -18,42 +18,6 @@ add_subdirectory(unwind)
 add_subdirectory(util)
 add_subdirectory(network_proxy)
 
-# sandboxed_api/sandbox2:allow_all_syscalls
-add_library(sandbox2_allow_all_syscalls ${SAPI_LIB_TYPE}
-  allow_all_syscalls.h
-)
-add_library(sandbox2::allow_all_syscalls ALIAS sandbox2_allow_all_syscalls)
-target_link_libraries(sandbox2_allow_all_syscalls PRIVATE
-  sapi::base
-)
-
-# sandboxed_api/sandbox2:allow_map_exec
-add_library(sandbox2_allow_map_exec ${SAPI_LIB_TYPE}
-  allow_map_exec.h
-)
-add_library(sandbox2::allow_allow_map_exec ALIAS sandbox2_allow_map_exec)
-target_link_libraries(sandbox2_allow_map_exec PRIVATE
-  sapi::base
-)
-
-# sandboxed_api/sandbox2:allow_seccomp_speculation
-add_library(sandbox2_allow_seccomp_speculation ${SAPI_LIB_TYPE}
-  allow_seccomp_speculation.h
-)
-add_library(sandbox2::allow_seccomp_speculation ALIAS sandbox2_allow_seccomp_speculation)
-target_link_libraries(sandbox2_allow_seccomp_speculation PRIVATE
-  sapi::base
-)
-
-# sandboxed_api/sandbox2:allow_unrestricted_networking
-add_library(sandbox2_allow_unrestricted_networking ${SAPI_LIB_TYPE}
-  allow_unrestricted_networking.h
-)
-add_library(sandbox2::allow_unrestricted_networking ALIAS sandbox2_allow_unrestricted_networking)
-target_link_libraries(sandbox2_allow_unrestricted_networking PRIVATE
-  sapi::base
-)
-
 # sandboxed_api/sandbox2:bpfdisassembler
 add_library(sandbox2_bpfdisassembler ${SAPI_LIB_TYPE}
   bpfdisassembler.cc
@@ -206,6 +170,7 @@ target_link_libraries(sandbox2_policy
          sandbox2::bpf_helper
          sandbox2::bpfdisassembler
          sandbox2::regs
+         sandbox2::seccomp_unotify
          sandbox2::syscall
          sapi::base
          sapi::config
@@ -349,7 +314,9 @@ add_library(sandbox2_sandbox2 ${SAPI_LIB_TYPE}
 add_library(sandbox2::sandbox2 ALIAS sandbox2_sandbox2)
 target_link_libraries(sandbox2_sandbox2
   PRIVATE absl::core_headers
+          absl::check
           absl::flat_hash_set
+          absl::log
           absl::memory
           absl::optional
           absl::str_format
@@ -358,34 +325,35 @@ target_link_libraries(sandbox2_sandbox2
           sandbox2::monitor_ptrace
           sandbox2::monitor_unotify
           sapi::base
-  PUBLIC  absl::flat_hash_map
-          absl::status
-          absl::statusor
-          absl::time
-          sapi::config
-          sapi::fileops
-          sapi::temp_file
-          sandbox2::client
-          sandbox2::comms
-          sandbox2::executor
-          sandbox2::fork_client
-          sandbox2::global_forkserver
-          sandbox2::ipc
-          sandbox2::limits
-          sandbox2::logsink
-          sandbox2::monitor_base
-          sandbox2::mounts
-          sandbox2::mount_tree_proto
-          sandbox2::namespace
-          sandbox2::network_proxy_client
-          sandbox2::network_proxy_server
-          sandbox2::notify
-          sandbox2::policy
-          sandbox2::policybuilder
-          sandbox2::regs
-          sandbox2::result
-          sandbox2::syscall
-          sandbox2::util
+  PUBLIC absl::die_if_null
+         absl::flat_hash_map
+         absl::status
+         absl::statusor
+         absl::time
+         sapi::config
+         sapi::fileops
+         sapi::temp_file
+         sandbox2::client
+         sandbox2::comms
+         sandbox2::executor
+         sandbox2::fork_client
+         sandbox2::global_forkserver
+         sandbox2::ipc
+         sandbox2::limits
+         sandbox2::logsink
+         sandbox2::monitor_base
+         sandbox2::mounts
+         sandbox2::mount_tree_proto
+         sandbox2::namespace
+         sandbox2::network_proxy_client
+         sandbox2::network_proxy_server
+         sandbox2::notify
+         sandbox2::policy
+         sandbox2::policybuilder
+         sandbox2::regs
+         sandbox2::result
+         sandbox2::syscall
+         sandbox2::util
 )
 
 
@@ -523,7 +491,8 @@ target_link_libraries(sandbox2_monitor_unotify
           sandbox2::bpf_evaluator
           sandbox2::client
           sandbox2::forkserver_proto
-          sapi::config
+          sandbox2::seccomp_unotify
+          sandbox2::util
           sapi::status
   PUBLIC sandbox2::executor
          sandbox2::monitor_base
@@ -733,7 +702,8 @@ target_link_libraries(sandbox2_util
           sapi::base
           sapi::raw_logging
           sapi::status
-  PUBLIC absl::span
+  PUBLIC absl::log
+         absl::span
          absl::status
          absl::statusor
 )
@@ -744,6 +714,19 @@ target_compile_options(sandbox2_util PRIVATE
   -Wframe-larger-than=17000
 )
 
+# sandboxed_api/sandbox2:util_c
+add_library(sandbox2_util_c ${SAPI_LIB_TYPE}
+  util_c.cc
+  util_c.h
+)
+add_library(sandbox2::util_c ALIAS sandbox2_util_c)
+target_link_libraries(sandbox2_util_c
+  PRIVATE absl::statusor
+          absl::log
+          sandbox2::util
+          sapi::base
+)
+
 # sandboxed_api/sandbox2:buffer
 add_library(sandbox2_buffer ${SAPI_LIB_TYPE}
   buffer.cc
@@ -751,15 +734,13 @@ add_library(sandbox2_buffer ${SAPI_LIB_TYPE}
 )
 add_library(sandbox2::buffer ALIAS sandbox2_buffer)
 target_link_libraries(sandbox2_buffer
-  PRIVATE absl::core_headers
-          absl::memory
+  PRIVATE absl::memory
           absl::status
-          absl::strings
-          sapi::strerror
-          sandbox2::util
           sapi::base
-          sapi::status
-  PUBLIC absl::statusor
+          sandbox2::util
+  PUBLIC absl::core_headers
+         absl::statusor
+         sapi::fileops
 )
 
 # sandboxed_api/sandbox2:forkserver_proto
@@ -1048,6 +1029,7 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
   )
   add_dependencies(sandbox2_policy_test
     sandbox2::testcase_add_policy_on_syscalls
+    sandbox2::testcase_execveat
     sandbox2::testcase_malloc_system
     sandbox2::testcase_minimal
     sandbox2::testcase_minimal_dynamic
@@ -1056,6 +1038,7 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
   )
   target_link_libraries(sandbox2_policy_test PRIVATE
     absl::strings
+    sandbox2::allowlists_seccomp_speculation
     sandbox2::bpf_helper
     sapi::config
     sandbox2::sandbox2
