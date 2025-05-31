@@ -22,26 +22,34 @@
 #include "absl/strings/str_cat.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/QualTypeNames.h"
 #include "clang/AST/Type.h"
-#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Casting.h"
 
 namespace sapi {
 namespace {
 
-bool IsFunctionReferenceType(clang::QualType qual) {
-#if LLVM_VERSION_MAJOR >= 9
-  return qual->isFunctionReferenceType();
-#else
-  const auto* ref = qual->getAs<clang::ReferenceType>();
-  return ref && ref->getPointeeType()->isFunctionType();
-#endif
+bool IsProtoBuf(const clang::RecordDecl* decl) {
+  const auto* cxxdecl = llvm::dyn_cast<const clang::CXXRecordDecl>(decl);
+  if (cxxdecl == nullptr) {
+    return false;
+  }
+  if (!cxxdecl->hasDefinition()) {
+    return false;
+  }
+  for (const clang::CXXBaseSpecifier& base : cxxdecl->bases()) {
+    if (base.getType()->getAsCXXRecordDecl()->getQualifiedNameAsString() ==
+        "google::protobuf::Message") {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace
 
-void TypeCollector::RecordOrderedDecl(clang::TypeDecl* type_decl) {
+void TypeCollector::RecordOrderedTypeDeclarations(clang::TypeDecl* type_decl) {
   // This implicitly assigns a number (its source order) to each declaration.
   ordered_decls_.push_back(type_decl);
 }
@@ -53,8 +61,11 @@ void TypeCollector::CollectRelatedTypes(clang::QualType qual) {
 
   if (const auto* record_type = qual->getAs<clang::RecordType>()) {
     const clang::RecordDecl* decl = record_type->getDecl();
-    for (const clang::FieldDecl* field : decl->fields()) {
-      CollectRelatedTypes(field->getType());
+    // Do not collect internals of a protobuf message.
+    if (!IsProtoBuf(decl)) {
+      for (const clang::FieldDecl* field : decl->fields()) {
+        CollectRelatedTypes(field->getType());
+      }
     }
     // Do not collect structs/unions if they are declared within another
     // record. The enclosing type is enough to reconstruct the AST when
@@ -75,7 +86,7 @@ void TypeCollector::CollectRelatedTypes(clang::QualType qual) {
     return;
   }
 
-  if (qual->isFunctionPointerType() || IsFunctionReferenceType(qual) ||
+  if (qual->isFunctionPointerType() || qual->isFunctionReferenceType() ||
       qual->isMemberFunctionPointerType()) {
     if (const auto* function_type = qual->getPointeeOrArrayElementType()
                                         ->getAs<clang::FunctionProtoType>()) {
@@ -122,7 +133,7 @@ std::string GetQualTypeName(const clang::ASTContext& context,
   clang::QualType unqual = qual.getLocalUnqualifiedType();
 
   // This is to get to the actual name of function pointers.
-  if (unqual->isFunctionPointerType() || IsFunctionReferenceType(unqual) ||
+  if (unqual->isFunctionPointerType() || unqual->isFunctionReferenceType() ||
       unqual->isMemberFunctionPointerType()) {
     unqual = unqual->getPointeeType();
   }
@@ -198,13 +209,7 @@ namespace {
 // type. Keeps top-level typedef types intact.
 clang::QualType MaybeRemoveConst(const clang::ASTContext& context,
                                  clang::QualType qual) {
-  if (
-#if LLVM_VERSION_MAJOR < 13
-      qual->getAs<clang::TypedefType>() == nullptr
-#else
-      !qual->isTypedefNameType()
-#endif
-      && IsPointerOrReference(qual)) {
+  if (!qual->isTypedefNameType() && IsPointerOrReference(qual)) {
     clang::QualType pointee_qual = qual->getPointeeType();
     pointee_qual.removeLocalConst();
     qual = context.getPointerType(pointee_qual);

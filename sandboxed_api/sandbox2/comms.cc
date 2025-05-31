@@ -204,7 +204,6 @@ void Comms::Terminate() {
   state_ = State::kTerminated;
 
   raw_comms_ = std::unique_ptr<RawComms>();
-  listening_comms_.reset();
 }
 
 bool Comms::SendTLV(uint32_t tag, size_t length, const void* value) {
@@ -253,6 +252,9 @@ bool Comms::SendTLV(uint32_t tag, size_t length, const void* value) {
 bool Comms::RecvString(std::string* v) {
   uint32_t tag;
   if (!RecvTLV(&tag, v)) {
+    if (IsConnected()) {
+      SAPI_RAW_LOG(ERROR, "RecvString failed for (%s)", name_.c_str());
+    }
     return false;
   }
 
@@ -272,6 +274,9 @@ bool Comms::SendString(const std::string& v) {
 bool Comms::RecvBytes(std::vector<uint8_t>* buffer) {
   uint32_t tag;
   if (!RecvTLV(&tag, buffer)) {
+    if (IsConnected()) {
+      SAPI_RAW_LOG(ERROR, "RecvBytes failed for (%s)", name_.c_str());
+    }
     return false;
   }
   if (tag != kTagBytes) {
@@ -338,10 +343,12 @@ bool Comms::RecvFD(int* fd) {
 
   ssize_t len = GetRawComms()->RawRecvMsg(&msg);
   if (len < 0) {
-    if (IsFatalError(errno)) {
+    bool fatal = IsFatalError(errno);
+    SAPI_RAW_PLOG(ERROR, "recvmsg(SCM_RIGHTS): %s error",
+                  fatal ? "fatal" : "normal");
+    if (fatal) {
       Terminate();
     }
-    SAPI_RAW_PLOG(ERROR, "recvmsg(SCM_RIGHTS)");
     return false;
   }
   if (len == 0) {
@@ -424,10 +431,12 @@ bool Comms::SendFD(int fd) {
     return false;
   }
   if (len < 0) {
-    if (IsFatalError(errno)) {
+    bool fatal = IsFatalError(errno);
+    SAPI_RAW_PLOG(ERROR, "sendmsg(SCM_RIGHTS): %s error",
+                  fatal ? "fatal" : "normal");
+    if (fatal) {
       Terminate();
     }
-    SAPI_RAW_PLOG(ERROR, "sendmsg(SCM_RIGHTS)");
     return false;
   }
   if (len != sizeof(tlv)) {
@@ -443,10 +452,7 @@ bool Comms::RecvProtoBuf(google::protobuf::MessageLite* message) {
   std::vector<uint8_t> bytes;
   if (!RecvTLV(&tag, &bytes)) {
     if (IsConnected()) {
-      SAPI_RAW_PLOG(ERROR, "RecvProtoBuf failed for (%s)", name_);
-    } else {
-      Terminate();
-      SAPI_RAW_VLOG(2, "Connection terminated (%s)", name_.c_str());
+      SAPI_RAW_LOG(ERROR, "RecvProtoBuf failed for (%s)", name_.c_str());
     }
     return false;
   }
@@ -526,8 +532,9 @@ bool Comms::Send(const void* data, size_t len) {
       return false;
     }
     if (s == -1) {
-      SAPI_RAW_PLOG(ERROR, "write");
-      if (IsFatalError(errno)) {
+      bool fatal = IsFatalError(errno);
+      SAPI_RAW_PLOG(ERROR, "write: %s error", fatal ? "fatal" : "normal");
+      if (fatal) {
         Terminate();
       }
       return false;
@@ -554,8 +561,9 @@ bool Comms::Recv(void* data, size_t len) {
   while (total_recv < len) {
     ssize_t s = GetRawComms()->RawRecv(&bytes[total_recv], len - total_recv);
     if (s == -1) {
-      SAPI_RAW_PLOG(ERROR, "read");
-      if (IsFatalError(errno)) {
+      bool fatal = IsFatalError(errno);
+      SAPI_RAW_PLOG(ERROR, "read: %s error", fatal ? "fatal" : "normal");
+      if (fatal) {
         Terminate();
       }
       return false;

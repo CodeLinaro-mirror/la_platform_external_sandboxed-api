@@ -80,10 +80,27 @@ class MonitorBase {
   virtual void SetWallTimeLimit(absl::Duration limit) = 0;
 
  protected:
+  // Sends the policy to the client.
+  // Can be overridden by subclasses to save/modify policy before sending.
+  // Returns success/failure status.
+  virtual absl::Status SendPolicy(const std::vector<sock_filter>& policy);
+
+  bool wait_for_execveat() const { return wait_for_execveat_; }
+  void set_wait_for_execveat(bool wait_for_execve) {
+    wait_for_execveat_ = wait_for_execve;
+  }
+
   void OnDone();
+
+  // Sends a message to the client that we're ready to monitor it.
+  // The message contains the monitor type and final sandboxee mode flags
+  // (currently only flag to allow speculation for the seccomped process).
+  bool SendMonitorReadyMessageAndFlags(uint32_t monitor_type);
+
   // Sets basic info status and reason code in the result object.
   void SetExitStatusCode(Result::StatusEnum final_status,
                          uintptr_t reason_code);
+
   // Logs a SANDBOX VIOLATION message based on the registers and additional
   // explanation for the reason of the violation.
   void LogSyscallViolation(const Syscall& syscall) const;
@@ -103,8 +120,9 @@ class MonitorBase {
 
   // Internal objects, owned by the Sandbox2 object.
   Executor* executor_;
-  Notify* notify_;
   Policy* policy_;
+  Notify* notify_;
+
   // The sandboxee process.
   SandboxeeProcess process_;
   Result result_;
@@ -118,12 +136,6 @@ class MonitorBase {
   std::unique_ptr<NetworkProxyServer> network_proxy_server_;
   // Monitor type
   MonitorType type_ = FORKSERVER_MONITOR_PTRACE;
-
- protected:
-  // Sends Policy to the Client.
-  // Can be overridden by subclasses to save/modify policy before sending.
-  // Returns success/failure status.
-  virtual absl::Status SendPolicy(const std::vector<sock_filter>& policy);
 
  private:
   // Instantiates and sends Policy to the Client.
@@ -168,6 +180,9 @@ class MonitorBase {
 
   // Is the sandboxee forked from a custom forkserver?
   bool uses_custom_forkserver_;
+
+  // Are we waiting for the first execveat syscall?
+  bool wait_for_execveat_ = false;
 };
 
 }  // namespace sandbox2

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
@@ -36,9 +37,20 @@
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include "sandboxed_api/testing.h"
+#include "sandboxed_api/util/file_helpers.h"
+#include "sandboxed_api/util/path.h"
 
 namespace sapi {
 namespace internal {
+
+std::string GetTestFileContents(absl::string_view file) {
+  std::string contents;
+  CHECK_OK(file::GetContents(GetTestSourcePath(file::JoinPath(
+                                 "tools/clang_generator/testdata/", file)),
+                             &contents, file::Defaults()));
+  return contents;
+}
 
 absl::Status RunClangTool(
     const std::vector<std::string>& command_line,
@@ -58,13 +70,8 @@ absl::Status RunClangTool(
     }
   }
 
-#if LLVM_VERSION_MAJOR >= 10
   clang::tooling::ToolInvocation invocation(command_line, std::move(action),
                                             files.get());
-#else
-  clang::tooling::ToolInvocation invocation(command_line, action.get(),
-                                            files.get());
-#endif
   if (!invocation.run()) {
     return absl::UnknownError("Tool invocation failed");
   }
@@ -79,6 +86,7 @@ std::vector<std::string> FrontendActionTest::GetCommandLineFlagsForTesting(
           "-I.",  "-Wno-error",    std::string(input_file)};
 }
 
+// Replaces all newlines with spaces and removes consecutive runs of whitespace.
 std::string Uglify(absl::string_view code) {
   std::string result = absl::StrReplaceAll(code, {{"\n", " "}});
   absl::RemoveExtraAsciiWhitespace(&result);

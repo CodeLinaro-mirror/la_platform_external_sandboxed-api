@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Minimum supported: LLVM 11.0.0
+# Minimum supported: LLVM 18.0.0
 find_package(LLVM REQUIRED)
 find_package(Clang REQUIRED)
-if(LLVM_VERSION VERSION_LESS "11.0.0")
-  message(FATAL_ERROR "SAPI header generator needs LLVM 11 or newer")
+if(LLVM_VERSION VERSION_LESS "18.0.0")
+  message(FATAL_ERROR "SAPI header generator needs LLVM 18 or newer")
 endif()
 
 add_library(sapi_generator
@@ -28,6 +28,7 @@ add_library(sapi_generator
   emitter_base.cc
   generator.h
   generator.cc
+  includes.h
   types.h
   types.cc
 )
@@ -54,11 +55,9 @@ list(APPEND _sapi_generator_llvm_comp
   BinaryFormat
   Demangle
 )
-if(LLVM_VERSION VERSION_GREATER_EQUAL "15.0.0")
-  list(APPEND _sapi_generator_llvm_comp
-    WindowsDriver # Always needed
-  )
-endif()
+list(APPEND _sapi_generator_llvm_comp
+  WindowsDriver # Always needed
+)
 llvm_map_components_to_libnames(_sapi_generator_llvm_libs
   ${_sapi_generator_llvm_comp}
 )
@@ -148,15 +147,20 @@ if(BUILD_TESTING AND SAPI_BUILD_TESTING)
     emitter_test.cc
   )
   target_link_libraries(sapi_generator_test PRIVATE
+    absl::check
     absl::flat_hash_map
     absl::memory
     absl::statusor
     benchmark
+    sapi::file_base
+    sapi::file_helpers
+    sapi::runfiles
     sapi::sapi
     sapi::generator
     sapi::status
     sapi::status_matchers
     sapi::test_main
   )
-  gtest_discover_tests_xcompile(sapi_generator_test)
+  gtest_discover_tests_xcompile(sapi_generator_test
+    ENVIRONMENT "TEST_DATA_DIR=${PROJECT_SOURCE_DIR}/testdata")
 endif()

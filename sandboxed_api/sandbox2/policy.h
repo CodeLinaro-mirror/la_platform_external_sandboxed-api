@@ -56,7 +56,8 @@ class Policy final {
 
   // Returns the policy, but modifies it according to FLAGS and internal
   // requirements (message passing via Comms, Executor::WaitForExecve etc.).
-  std::vector<sock_filter> GetPolicy(bool user_notif) const;
+  std::vector<sock_filter> GetPolicy(bool user_notif,
+                                     bool enable_sandboxing_pre_execve) const;
 
   const std::optional<Namespace>& GetNamespace() const { return namespace_; }
   const Namespace* GetNamespaceOrNull() const {
@@ -65,7 +66,8 @@ class Policy final {
 
   // Returns the default policy, which blocks certain dangerous syscalls and
   // mismatched syscall tables.
-  std::vector<sock_filter> GetDefaultPolicy(bool user_notif) const;
+  std::vector<sock_filter> GetDefaultPolicy(
+      bool user_notif, bool enable_sandboxing_pre_execve) const;
   // Returns a policy allowing the Monitor module to track all syscalls.
   std::vector<sock_filter> GetTrackingPolicy() const;
 
@@ -96,6 +98,7 @@ class Policy final {
   bool collect_stacktrace_on_exit_ = false;
 
   bool allow_map_exec_ = false;
+  bool allow_safe_bpf_ = false;
   bool allow_speculation_ = false;
 
   // The policy set by the user.
