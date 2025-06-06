@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load(
-    "@com_google_sandboxed_api//sandboxed_api/bazel:sapi.bzl",
-    "sapi_library",
-)
+load("//sandboxed_api/bazel:sapi.bzl", "sapi_library")
+
+package(default_visibility = ["//sandboxed_api:__subpackages__"])
+
+licenses(["notice"])
 
 # Library with code that should be sandboxed
 cc_library(
@@ -30,7 +31,7 @@ sapi_library(
     functions = [
         "AddTwoIntegers",
     ],
-    generator_version = 1,
+    generator_version = 2,
     input_files = ["hello_lib.cc"],
     lib = ":hello_lib",
     lib_name = "Hello",
@@ -52,8 +53,10 @@ cc_binary(
     srcs = ["hello_transacted.cc"],
     deps = [
         ":hello_sapi",
-        "@com_google_absl//absl/memory",
-        "@com_google_absl//absl/status",
-        "@com_google_sandboxed_api//sandboxed_api/util:status",
+        "//sandboxed_api:sapi",
+        "//sandboxed_api/sandbox2:policy",
+        "//sandboxed_api/sandbox2:policybuilder",
+        "//sandboxed_api/util:status",
+        "@abseil-cpp//absl/status",
     ],
 )

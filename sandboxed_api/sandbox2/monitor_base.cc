@@ -128,12 +128,13 @@ void LogContainer(const std::vector<std::string>& container) {
 
 MonitorBase::MonitorBase(Executor* executor, Policy* policy, Notify* notify)
     : executor_(executor),
-      notify_(notify),
       policy_(policy),
+      notify_(notify),
       // NOLINTNEXTLINE clang-diagnostic-deprecated-declarations
       comms_(executor_->ipc()->comms()),
       ipc_(executor_->ipc()),
       uses_custom_forkserver_(executor_->fork_client_ != nullptr) {
+  wait_for_execveat_ = executor->enable_sandboxing_pre_execve_;
   // It's a pre-connected Comms channel, no need to accept new connection.
   CHECK(comms_->IsConnected());
   std::string path =
@@ -277,9 +278,18 @@ absl::Status MonitorBase::SendPolicy(const std::vector<sock_filter>& policy) {
   return absl::OkStatus();
 }
 
+bool MonitorBase::SendMonitorReadyMessageAndFlags(uint32_t monitor_type) {
+  uint32_t message = monitor_type;
+  if (policy_->allow_speculation_) {
+    message |= Client::kAllowSpeculationBit;
+  }
+  return comms_->SendUint32(message);
+}
+
 bool MonitorBase::InitSendPolicy() {
   bool user_notif = type_ == FORKSERVER_MONITOR_UNOTIFY;
-  auto policy = policy_->GetPolicy(user_notif);
+  auto policy =
+      policy_->GetPolicy(user_notif, executor_->enable_sandboxing_pre_execve_);
   absl::Status status = SendPolicy(std::move(policy));
   if (!status.ok()) {
     LOG(ERROR) << "Couldn't send policy: " << status;

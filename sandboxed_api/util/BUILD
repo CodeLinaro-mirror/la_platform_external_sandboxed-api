@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@com_google_sandboxed_api//sandboxed_api/bazel:build_defs.bzl", "sapi_platform_copts")
-load("@com_google_sandboxed_api//sandboxed_api/bazel:proto.bzl", "sapi_proto_library")
+load("//sandboxed_api/bazel:build_defs.bzl", "sapi_platform_copts")
+load("//sandboxed_api/bazel:proto.bzl", "sapi_proto_library")
 
 package(default_visibility = [
-    "@com_google_sandboxed_api//sandboxed_api:__subpackages__",
+    "//sandboxed_api:__subpackages__",
 ])
 
 licenses(["notice"])
@@ -27,7 +27,7 @@ cc_library(
     srcs = ["path.cc"],
     hdrs = ["path.h"],
     copts = sapi_platform_copts(),
-    deps = ["@com_google_absl//absl/strings"],
+    deps = ["@abseil-cpp//absl/strings"],
 )
 
 cc_test(
@@ -37,8 +37,8 @@ cc_test(
     copts = sapi_platform_copts(),
     deps = [
         ":file_base",
-        "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest_main",
+        "@abseil-cpp//absl/strings",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -49,8 +49,8 @@ cc_library(
     hdrs = ["file_helpers.h"],
     copts = sapi_platform_copts(),
     deps = [
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
@@ -62,7 +62,7 @@ cc_test(
     deps = [
         ":file_helpers",
         ":status_matchers",
-        "@com_google_googletest//:gtest_main",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -72,9 +72,10 @@ cc_library(
     srcs = ["fileops.cc"],
     hdrs = ["fileops.h"],
     copts = sapi_platform_copts(),
+    visibility = ["//visibility:public"],
     deps = [
         ":strerror",
-        "@com_google_absl//absl/strings",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
@@ -87,9 +88,9 @@ cc_test(
         ":file_helpers",
         ":fileops",
         ":status_matchers",
-        "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest_main",
-        "@com_google_sandboxed_api//sandboxed_api:testing",
+        "//sandboxed_api:testing",
+        "@abseil-cpp//absl/strings",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -107,8 +108,8 @@ cc_library(
     deps = [
         ":proto_arg_cc_proto",
         ":status",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
         "@com_google_protobuf//:protobuf_lite",
     ],
 )
@@ -122,11 +123,11 @@ cc_library(
     copts = sapi_platform_copts(),
     deps = [
         ":strerror",
-        "@com_google_absl//absl/base:config",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/base:log_severity",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
+        "@abseil-cpp//absl/base:config",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/base:log_severity",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
     ],
 )
 
@@ -138,10 +139,10 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":file_base",
+        ":raw_logging",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
         "@bazel_tools//tools/cpp/runfiles",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_sandboxed_api//sandboxed_api/util:raw_logging",
     ],
 )
 
@@ -162,10 +163,10 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":status_cc_proto",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:cord",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:cord",
     ],
 )
 
@@ -179,11 +180,11 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":status",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/types:optional",
-        "@com_google_googletest//:gtest",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings:string_view",
+        "@abseil-cpp//absl/types:optional",
+        "@googletest//:gtest",
     ],
 )
 
@@ -195,9 +196,9 @@ cc_test(
     deps = [
         ":status",
         ":status_cc_proto",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_googletest//:gtest_main",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings:string_view",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -209,10 +210,10 @@ cc_test(
     deps = [
         ":status",
         ":status_matchers",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest_main",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -224,8 +225,8 @@ cc_library(
     hdrs = ["strerror.h"],
     copts = sapi_platform_copts(),
     deps = [
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/strings:str_format",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/strings:str_format",
     ],
 )
 
@@ -236,8 +237,8 @@ cc_test(
     deps = [
         ":strerror",
         ":thread",
-        "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest_main",
+        "@abseil-cpp//absl/strings",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -248,9 +249,9 @@ cc_library(
     copts = sapi_platform_copts(),
     deps = [
         ":status",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
@@ -263,10 +264,10 @@ cc_test(
         ":fileops",
         ":status_matchers",
         ":temp_file",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_googletest//:gtest_main",
-        "@com_google_sandboxed_api//sandboxed_api:testing",
+        "//sandboxed_api:testing",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -275,7 +276,7 @@ cc_library(
     hdrs = ["thread.h"],
     copts = sapi_platform_copts(),
     deps = [
-        "@com_google_absl//absl/functional:any_invocable",
-        "@com_google_absl//absl/strings:string_view",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/strings:string_view",
     ],
 )

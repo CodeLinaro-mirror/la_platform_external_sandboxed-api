@@ -37,6 +37,10 @@
 
 namespace sandbox2 {
 
+// Forward declarations for friend declarations.
+class MonitorBase;
+class StackTracePeer;
+
 // The sandbox2::Executor class is responsible for both creating and executing
 // new processes which will be sandboxed.
 class Executor final {
@@ -102,7 +106,6 @@ class Executor final {
 
  private:
   friend class MonitorBase;
-  friend class PtraceMonitor;
   friend class StackTracePeer;
 
   // Internal constructor for executing libunwind on the given pid

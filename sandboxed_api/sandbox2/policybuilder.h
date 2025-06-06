@@ -21,8 +21,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -49,19 +49,10 @@ class AllowAllSyscalls;
 class NamespacesToken;
 class LoadUserBpfCodeFromFile;
 class MapExec;
+class UnsafeCoreDumpPtrace;
 class SeccompSpeculation;
 class TraceAllSyscalls;
 class UnrestrictedNetworking;
-
-namespace builder_internal {
-
-template <typename, typename = void>
-constexpr bool is_type_complete_v = false;
-
-template <typename T>
-constexpr bool is_type_complete_v<T, std::void_t<decltype(sizeof(T))>> = true;
-
-}  // namespace builder_internal
 
 // PolicyBuilder is a helper class to simplify creation of policies. The builder
 // uses fluent interface for convenience and increased readability of policies.
@@ -334,17 +325,18 @@ class PolicyBuilder final {
   // Appends code to unconditionally allow mmap. Specifically this allows mmap
   // and mmap2 syscall on architectures where these syscalls exist.
   //
-  // This function requires that targets :map_exec library to be linked
-  // against. Otherwise, the PolicyBuilder will fail to build the policy.
-  //
   // Prefer using `AllowMmapWithoutExec()` as allowing mapping executable pages
   // makes exploitation easier.
-  std::enable_if_t<builder_internal::is_type_complete_v<MapExec>,
-                   PolicyBuilder&>
-  AllowMmap();
+  PolicyBuilder& AllowMmap(MapExec);
+
+  ABSL_DEPRECATED("Use AllowMmap(MapExec) or AllowMmapWithoutExec() instead.")
+  PolicyBuilder& AllowMmap();
 
   // Appends code to allow mmap calls that don't specify PROT_EXEC.
   PolicyBuilder& AllowMmapWithoutExec();
+
+  // Appends code to allow mprotect (also with PROT_EXEC).
+  PolicyBuilder& AllowMprotect(MapExec);
 
   // Appends code to allow mprotect calls that don't specify PROT_EXEC.
   PolicyBuilder& AllowMprotectWithoutExec();
@@ -706,9 +698,10 @@ class PolicyBuilder final {
   //
   // In addition to syscalls allowed by `AllowStaticStartup`, also allow
   // reading, seeking, mmap()-ing and closing files.
-  std::enable_if_t<builder_internal::is_type_complete_v<MapExec>,
-                   PolicyBuilder&>
-  AllowDynamicStartup();
+  PolicyBuilder& AllowDynamicStartup(MapExec);
+
+  ABSL_DEPRECATED("Use AllowDynamicStartup(MapExec) instead.")
+  PolicyBuilder& AllowDynamicStartup();
 
   // Appends a policy, which will be run on the specified syscall.
   //
@@ -779,7 +772,11 @@ class PolicyBuilder final {
   //
   // NOTE: This function will abort if an error happened in any of the
   // PolicyBuilder methods. This should only be called once.
-  std::unique_ptr<Policy> BuildOrDie() { return TryBuild().value(); }
+  std::unique_ptr<Policy> BuildOrDie() {
+    absl::StatusOr<std::unique_ptr<Policy>> policy = TryBuild();
+    CHECK_OK(policy);
+    return *std::move(policy);
+  }
 
   // Adds a bind-mount for a file from outside the namespace to inside.
   //
@@ -1017,6 +1014,7 @@ class PolicyBuilder final {
   bool requires_namespaces_ = false;
   NetNsMode netns_mode_ = NETNS_MODE_UNSPECIFIED;
   bool allow_map_exec_ = true;  //  Temporary default while we migrate users.
+  bool allow_safe_bpf_ = false;
   bool allow_speculation_ = false;
   bool allow_mount_propagation_ = false;
   std::string hostname_ = std::string(kDefaultHostname);
@@ -1055,7 +1053,6 @@ class PolicyBuilder final {
     bool madvise_populate = false;
     bool mmap_without_exec = false;
     bool mprotect_without_exec = false;
-    bool safe_bpf = false;
     bool safe_fcntl = false;
     bool tcgets = false;
     bool slow_fences = false;
