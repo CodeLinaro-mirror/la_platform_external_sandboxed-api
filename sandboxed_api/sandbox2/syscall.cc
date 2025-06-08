@@ -15,6 +15,7 @@
 #include "sandboxed_api/sandbox2/syscall.h"
 
 #include <linux/audit.h>
+#include <linux/seccomp.h>
 
 #include <cstdint>
 #include <string>
@@ -31,6 +32,34 @@
 #endif
 
 namespace sandbox2 {
+namespace {
+
+sapi::cpu::Architecture AuditArchToCPUArch(uint32_t arch) {
+  switch (arch) {
+    case AUDIT_ARCH_AARCH64:
+      return sapi::cpu::Architecture::kArm64;
+    case AUDIT_ARCH_ARM:
+      return sapi::cpu::Architecture::kArm;
+    case AUDIT_ARCH_X86_64:
+      return sapi::cpu::Architecture::kX8664;
+    case AUDIT_ARCH_I386:
+      return sapi::cpu::Architecture::kX86;
+    case AUDIT_ARCH_PPC64LE:
+      return sapi::cpu::Architecture::kPPC64LE;
+    default:
+      return sapi::cpu::Architecture::kUnknown;
+  }
+}
+}  // namespace
+
+Syscall::Syscall(pid_t pid, const seccomp_data& data)
+    : arch_(AuditArchToCPUArch(data.arch)),
+      nr_(data.nr),
+      args_({data.args[0], data.args[1], data.args[2], data.args[3],
+             data.args[4], data.args[5]}),
+      pid_(pid),
+      sp_(0),
+      ip_(data.instruction_pointer) {}
 
 std::string Syscall::GetArchDescription(sapi::cpu::Architecture arch) {
   switch (arch) {

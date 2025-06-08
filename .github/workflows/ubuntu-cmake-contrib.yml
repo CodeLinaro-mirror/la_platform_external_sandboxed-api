@@ -10,26 +10,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04]
+        os: [ubuntu-24.04]
         contrib:
           - brotli
           - c-blosc
           - jsonnet
           - libidn2
           - libraw
-          - libtiff
           - libxls
-          - libzip
           - lodepng
           - pffft
         ignore-errors: [true]
         include:
           - compiler: clang
-            compiler-version: 11
-            libclang-version: 11
+            compiler-version: 14
+            libclang-version: 18
           - compiler: gcc
             compiler-version: 10
-            libclang-version: 11
+            libclang-version: 18
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.ignore-errors }}
 
